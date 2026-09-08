@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Cooperation · 本地协作管理</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <a class="brand" href="/" aria-label="Cooperation 首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+        <span>Cooperation</span>
+        <span class="brand-caption">本地协作管理</span>
+      </a>
+      <div class="connection"><span id="connection-dot" class="status-dot"></span><span id="connection-label">正在连接</span><span id="version" class="version"></span></div>
+    </header>
+
+    <main>
+      <div class="page-heading">
+        <div><p class="eyebrow">WORKSPACE</p><h1>让协作有迹可循</h1><p class="intro">管理多个目录的会话、协作消息与上下文维护。</p></div>
+        <div class="local-note"><span aria-hidden="true">⌁</span> 对话继续留在各自的客户端</div>
+      </div>
+
+      <form id="directory-form" class="directory-bar">
+        <label for="directory">项目目录</label>
+        <div class="directory-input-wrap"><svg aria-hidden="true" width="19" height="19" viewBox="0 0 24 24" fill="none"><path d="M3.5 7V5.5h6L12 8h8.5v11h-17V7Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg><input id="directory" name="directory" type="text" autocomplete="off" spellcheck="false" placeholder="输入项目的完整目录路径" required /></div>
+        <button id="load-directory" class="button primary" type="submit">添加目录 <span aria-hidden="true">＋</span></button>
+      </form>
+      <div class="scope-row"><p id="directory-scope">选择要查看的项目目录。</p><div class="scope-actions"><label class="recursive-option"><input id="recursive" type="checkbox" /> 新增目录包含子目录</label><button id="refresh-all" class="text-button" type="button" disabled><span aria-hidden="true">↻</span> 刷新</button></div></div>
+      <div id="directory-list" class="directory-list" role="group" aria-label="选择展示的项目目录"></div>
+      <div id="global-error" class="notice error-notice" role="alert" hidden></div>
+      <div id="warnings" class="notice warning-notice" hidden></div>
+
+      <div class="workspace-grid">
+        <section class="panel sessions-panel" aria-labelledby="sessions-title">
+          <div class="panel-heading"><div><p class="eyebrow">SESSIONS</p><h2 id="sessions-title">项目会话 <span id="session-count" class="count">0</span></h2></div><span class="section-symbol" aria-hidden="true">↗</span></div>
+          <div class="panel-controls">
+            <div id="session-filters" class="segmented" role="group" aria-label="筛选会话客户端"><button type="button" data-client="all" aria-pressed="true">全部</button><button type="button" data-client="codex" aria-pressed="false">Codex</button><button type="button" data-client="claude" aria-pressed="false">Claude</button></div>
+            <label class="search-field"><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.5"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><span class="sr-only">搜索会话名称或 ID</span><input id="session-search" type="search" placeholder="搜索名称或 ID" autocomplete="off" /></label>
+          </div>
+          <div id="session-state" class="empty-state" role="status"><div class="empty-glyph" aria-hidden="true">⌕</div><p>正在载入会话</p><span>读取本地会话信息…</span></div>
+          <ul id="session-list" class="session-list" aria-label="当前目录的会话" hidden></ul>
+          <div class="panel-footnote session-footnote"><span>每个会话的阈值和启用状态独立保存。</span><span id="session-status-note" hidden>展开“上下文管理”可读取原生实时状态。</span></div>
+        </section>
+
+        <section class="panel messages-panel" aria-labelledby="messages-title">
+          <div class="panel-heading"><div><p class="eyebrow">ACTIVITY</p><h2 id="messages-title">通信记录 <span id="message-count" class="count">0</span></h2></div><span class="history-label">仅记录经本工具发送的消息</span></div>
+          <div class="message-controls"><label class="search-field"><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.5"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><span class="sr-only">搜索消息内容、会话名称或 ID</span><input id="message-search" type="search" placeholder="搜索消息、会话名称或 ID" autocomplete="off" /></label><label class="client-select"><span class="sr-only">筛选消息客户端</span><select id="message-client"><option value="all">全部客户端</option><option value="codex">涉及 Codex</option><option value="claude">涉及 Claude</option></select></label></div>
+          <div id="message-error" class="inline-error" role="alert" hidden></div>
+          <div class="message-workspace">
+            <div class="message-feed"><div id="message-state" class="empty-state" role="status"><div class="empty-glyph" aria-hidden="true">⇄</div><p>正在载入通信记录</p><span>只展示经过此工具发送的消息。</span></div><ul id="message-list" class="message-list" aria-label="通信消息" hidden></ul></div>
+            <article id="message-detail" class="message-detail" aria-label="消息详情">
+              <div class="detail-placeholder"><div class="detail-placeholder-mark" aria-hidden="true">↗<span>↙</span></div><h3>每一次交接，都有记录</h3><p>选择一条消息，查看完整内容、<br />发送方与接收方。</p><span class="privacy-note">仅展示经本工具传递的消息</span></div>
+            </article>
+          </div>
+          <div class="panel-footnote"><span id="history-summary">消息中的会话名称保留发送时的记录。</span><span class="realtime-indicator"><span class="status-dot" aria-hidden="true"></span> 自动更新</span></div>
+        </section>
+      </div>
+      <footer class="page-footer"><span>Cooperation</span><p>通过地址连接会话 · 通过消息共享成果</p></footer>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

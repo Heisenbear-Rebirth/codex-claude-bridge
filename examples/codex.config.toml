@@ -1,0 +1,4 @@
+[mcp_servers.cooperation]
+command = "node"
+args = ["E:/Projects/Cooperation/bin/coop.mjs", "mcp", "--client", "codex"]
+tool_timeout_sec = 75

@@ -1,0 +1,13 @@
+{
+  "name": "cooperation",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local messaging between existing Codex and Claude Code conversations, with a user management page.",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node bin/coop.mjs serve",
+    "test": "node --test test/*.test.mjs"
+  },
+  "bin": { "coop": "bin/coop.mjs" }
+}

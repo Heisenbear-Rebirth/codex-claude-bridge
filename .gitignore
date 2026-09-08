@@ -1,0 +1,22 @@
+.cooperation/
+node_modules/
+*.log
+
+# Local agent settings, handoffs, native-session evidence and backups
+.claude/
+.codex/
+.agents/
+.env
+.env.*
+!.env.example
+HANDOFF.md
+docs/archive/
+verification/
+
+# Machine-specific build outputs and test scratch directories
+bin/claude-wrapper.exe
+bin/claude-wrapper.paths
+.*-test-*/
+
+# Local evidence maintenance helpers
+scripts/verify-management-migration.mjs

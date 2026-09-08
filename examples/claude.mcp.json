@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cooperation": {
+      "command": "node",
+      "args": ["E:/Projects/Cooperation/bin/coop.mjs", "mcp", "--client", "claude"]
+    }
+  }
+}
