@@ -99,3 +99,28 @@ test('reconciliation resumes a confirmed compaction without sending another comp
   h.endTurn(); await h.controller.advance(id); await h.controller.retry(id);
   assert.equal(h.compactCount(), 1); assert.equal(h.store.cycle(id).compactDispatched, true);
 });
+
+test('shutdown waits for the active observation despite later timer ticks', async t => {
+  let began, release, monitorClosed = false;
+  const started = new Promise(resolve => { began = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const controller = new MaintenanceController({ root: resolve('.'), intervalMs: 2,
+    store: { activeCycles: () => [], policies: () => [], event() {} }, service: {},
+    monitor: { async observeAll() { began(); await gate; return new Map(); }, close() { monitorClosed = true; } },
+  });
+  t.after(async () => { release(); await controller.close(); });
+  controller.start();
+  // Keep the test alive while the controller's unref'ed interval starts.
+  const keepAlive = setTimeout(() => {}, 1000);
+  try {
+    await started;
+    const active = controller.tickPromise;
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(controller.tickPromise, active);
+    const closing = controller.close();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(monitorClosed, false);
+    release(); await closing;
+    assert.equal(monitorClosed, true);
+  } finally { clearTimeout(keepAlive); }
+});

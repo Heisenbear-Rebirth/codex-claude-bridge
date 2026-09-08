@@ -33,3 +33,11 @@ Raw native transcripts, session IDs, local connection files, credentials, machin
 - Ordinary messages sent to Codex still use an authorized App Tools bridge environment. Native maintenance control uses an independent local IPC client.
 - Native permission checks remain in force. Claude may require a narrowly scoped project-level permission for the checkpoint CLI.
 - Ambiguous external outcomes are not automatically retried. Unknown delivery blocks subsequent messages for that recipient until reconciled.
+
+## Dashboard follow-up (2026-09-08)
+
+The current dashboard groups sessions by directory and client, scopes messages to expanded sessions, observes context while automatic compression is off, and saves threshold edits automatically. Startup and shutdown launchers run the project manager without closing native clients.
+
+All 70 automated checks passed. New coverage includes message scope, serialized saves and stale-write rejection, observation without an enabled policy, repeated discovery without nested snapshots, and shutdown waiting for in-flight observation. The live service returned a 9,325-byte monitoring response with no nested snapshots, all automatic policies off, no active cycles and no queued messages.
+
+The redesigned page has not received a fresh browser acceptance run: the available browser connection tool failed to initialize twice. Prior native maintenance and browser acceptance above apply to the earlier implementation; they do not establish the redesigned page's current visual and interaction quality.

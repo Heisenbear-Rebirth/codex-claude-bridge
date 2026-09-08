@@ -12,7 +12,7 @@ function option(name) { const index = args.indexOf(name); return index >= 0 ? ar
 try {
   if (command === 'serve') {
     const codexContext = { pipePath: process.env.CODEX_APP_TOOLS_PIPE_PATH, callerThreadId: process.env.CODEX_THREAD_ID, nodePath: process.env.CODEX_MCP_NODE_PATH };
-    const instance = await startServer({ root, port: Number(option('--port') || 0), defaultDirectory: resolve(option('--directory') || process.cwd()), codexContext });
+    const instance = await startServer({ root, port: Number(option('--port') || 0), defaultDirectory: resolve(option('--directory') || process.cwd()), codexContext, onShutdown: () => process.exit(0) });
     console.log(`Cooperation 管理台：${instance.url}`);
     console.log(`数据保存于：${resolve(root, '.cooperation')}`);
     if (!codexContext.pipePath || !codexContext.callerThreadId) console.log('未连接 Codex App 发送桥；会话元数据与消息记录仍可查看。');

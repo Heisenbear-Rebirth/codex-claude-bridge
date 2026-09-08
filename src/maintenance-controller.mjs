@@ -19,7 +19,7 @@ export class MaintenanceController {
   }
   start() {
     if (!this.timer) {
-      this.timer = setInterval(() => { this.tickPromise = this.tick().catch(error => this.store.event('manager_error', { error: error.message })); }, this.intervalMs); this.timer.unref();
+      this.timer = setInterval(() => { if (!this.closed && !this.ticking) this.tickPromise = this.tick().catch(error => this.store.event('manager_error', { error: error.message })); }, this.intervalMs); this.timer.unref();
       this.recoveryPromise = Promise.allSettled(this.store.activeCycles().filter(c => c.state === 'needs_attention' && c.reason?.startsWith('服务重启'))
         .map(c => this.reconcile(c.id).catch(() => {})));
     }
@@ -31,11 +31,14 @@ export class MaintenanceController {
       // Active cycles keep their lock even when a user disables the monitor.
       const cycles = this.store.activeCycles();
       for (const cycle of cycles.filter(c => !terminal.has(c.state))) void this.advance(cycle.id);
+      const observed = this.monitor.observeAll ? await this.monitor.observeAll() : null;
       await Promise.allSettled(this.store.policies().filter(p => p.enabled).map(async policy => {
         if (this.closed) return;
         const session = policy.session;
         if (this.store.activeCycle(session)) return;
-        const sample = await this.monitor.sample(session);
+        const sample = observed?.get(sessionKey(session)) || await this.monitor.sample(session);
+        const latestPolicy = this.store.getPolicy(session);
+        if (!latestPolicy?.enabled || latestPolicy.mode !== 'automatic' || latestPolicy.revision !== policy.revision) return;
         if (policy.mode === 'automatic' && sample.decision.action === 'trigger') {
           try { await this.trigger(session, policy, sample); }
           catch (e) { this.store.saveSnapshot(session, { ...sample, decision: { action: 'attention', reason: e.message } }); this.onUpdate(session); }

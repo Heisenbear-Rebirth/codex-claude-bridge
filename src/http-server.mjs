@@ -13,7 +13,7 @@ import { CheckpointService } from './checkpoint-service.mjs';
 import { readWrapperDirectories, wrapperEnabledFor, WrapperDirectorySettings } from './wrapper-directories.mjs';
 import { containsDirectory } from './directory-service.mjs';
 
-export async function startServer({ root, port = 47821, host = '127.0.0.1', defaultDirectory = root, codexContext, adapters, runtimeFactory, startMonitoring = true } = {}) {
+export async function startServer({ root, port = 47821, host = '127.0.0.1', defaultDirectory = root, codexContext, adapters, runtimeFactory, startMonitoring = true, onShutdown = () => {} } = {}) {
   if (host !== '127.0.0.1') throw new Error('管理台仅允许监听 127.0.0.1。');
   const dataDirectory = join(root, '.cooperation');
   await mkdir(dataDirectory, { recursive: true });
@@ -53,6 +53,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
     if (!found) throw new Error('找不到指定的会话。'); return publicSession(found);
   };
   let actualPort = port;
+  let closed = false, closingPromise;
   const server = createServer(async (request, response) => {
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
@@ -64,6 +65,18 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
     if (request.headers['sec-fetch-site'] === 'cross-site') return json(response, 403, { error: '不接受跨站请求。' });
     const url = new URL(request.url, `http://${expectedHost}`);
     try {
+      if (url.pathname === '/api/service/status' || url.pathname === '/api/service/stop') {
+        if (!equal(request.headers.authorization, `Bearer ${token}`)) return json(response, 401, { error: '需要本项目的管理服务凭据。' });
+        if (request.method === 'GET' && url.pathname === '/api/service/status') return json(response, 200, { service: 'cooperation', root, pid: process.pid, startedAt: connection.startedAt, closing: closed });
+        if (request.method === 'POST' && url.pathname === '/api/service/stop') {
+          const expected = await body(request);
+          if (expected.pid !== process.pid || expected.startedAt !== connection.startedAt) return json(response, 409, { error: '管理服务实例已改变，请重新运行关闭脚本。' });
+          json(response, 200, { status: 'stopping' });
+          setImmediate(() => { close().then(onShutdown).catch(error => process.stderr.write('Shutdown failed: ' + error.message + '\n')); });
+          return;
+        }
+        return json(response, 405, { error: 'Method not allowed' });
+      }
       if (request.method === 'GET' && url.pathname === '/api/config') {
         return json(response, 200, { version: '0.2.0', defaultDirectory, directories: await directoryRecords(), policyDefaults: POLICY_DEFAULTS, csrfToken,
           bridge: { codex: Boolean(codexContext?.pipePath && codexContext?.callerThreadId) }, warnings: store.warnings });
@@ -103,7 +116,14 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
         if (url.pathname === '/api/policies') {
           const session = await resolveSession(input.address);
           const patch = input.policy || {};
-          if (Object.keys(patch).some(key => !['enabled', 'mode', 'softPercent', 'hardPercent'].includes(key))) throw new Error('不支持的策略字段。');
+          if (Object.keys(patch).some(key => !['enabled', 'mode', 'softPercent', 'hardPercent', 'autoCompress'].includes(key))) throw new Error('不支持的策略字段。');
+          if (Object.hasOwn(patch, 'autoCompress')) {
+            if (typeof patch.autoCompress !== 'boolean' || Object.hasOwn(patch, 'mode') || Object.hasOwn(patch, 'enabled')) throw new Error('自动压缩开关格式不正确。');
+            patch.enabled = patch.autoCompress; patch.mode = 'automatic'; delete patch.autoCompress;
+          }
+          const currentPolicy = store.getPolicy(session);
+          if (input.expectedRevision !== undefined && input.expectedRevision !== (currentPolicy?.revision || 0))
+            return json(response, 409, { error: '策略已在其他窗口更新，请刷新后重试。', policy: currentPolicy });
           const policy = store.savePolicy(session, patch); publish('management', { client: session.client, id: session.id });
           return json(response, 200, { policy });
         }
@@ -127,7 +147,14 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
       if (request.method === 'GET' && url.pathname === '/api/messages') {
         const query = Object.fromEntries(url.searchParams);
         if (url.searchParams.has('directoryIds')) query.directories = scope(JSON.parse(url.searchParams.get('directoryIds')));
-        const messages = query.directories?.length === 0 ? [] : store.list(query);
+        let addresses = null;
+        if (url.searchParams.has('addresses')) {
+          const input = JSON.parse(url.searchParams.get('addresses'));
+          if (!Array.isArray(input) || input.length > 2000 || input.some(a => typeof a !== 'string')) throw new Error('会话筛选格式不正确。');
+          addresses = new Set(input.map(a => { const s = parseAddress(a); return s.client + ':' + s.id.toLowerCase(); }));
+        }
+        const messages = (query.directories?.length === 0 ? [] : store.list(query)).filter(message => addresses === null ||
+          [message.from, message.to].some(s => addresses.has(s.client + ':' + s.id.toLowerCase())));
         return json(response, 200, { messages, total: messages.length });
       }
       if (request.method === 'GET' && url.pathname === '/api/events') {
@@ -146,7 +173,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
         if (!equal(request.headers.authorization, `Bearer ${token}`)) return json(response, 401, { error: '需要本机通信客户端凭据。' });
         return json(response, 200, await checkpoints.accept(await body(request)));
       }
-      const assets = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/styles.css': ['styles.css', 'text/css'] };
+      const assets = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui-state.mjs': ['ui-state.mjs', 'text/javascript'], '/styles.css': ['styles.css', 'text/css'] };
       if (request.method === 'GET' && assets[url.pathname]) {
         const [filename, type] = assets[url.pathname];
         response.writeHead(200, { 'Content-Type': `${type}; charset=utf-8` });
@@ -161,16 +188,18 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
   const connection = { url: `http://${host}:${actualPort}`, token, pid: process.pid, startedAt: new Date().toISOString() };
   const connectionFile = join(dataDirectory, 'connection.json');
   await writeFile(connectionFile, JSON.stringify(connection, null, 2) + '\n', { mode: 0o600 });
-  if (startMonitoring) controller.start();
-  let closed = false;
+  if (startMonitoring) { controller.start(); controller.tickPromise = controller.tick().catch(error => store.event('manager_error', { error: error.message })); }
   async function close() {
-    if (closed) return; closed = true;
+    if (closed) return closingPromise; closed = true;
+    closingPromise = (async () => {
     await controller.close(); await service.mailbox.close();
     for (const response of streams) response.end();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
     try { const saved = JSON.parse(await readFile(connectionFile, 'utf8')); if (saved.pid === process.pid) await unlink(connectionFile); } catch { /* Already removed. */ }
     store.close();
+    })();
+    return closingPromise;
   }
   return { server, url: connection.url, close, service, store, monitor, controller, checkpoints };
 }

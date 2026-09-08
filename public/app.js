@@ -1,460 +1,325 @@
-'use strict';
-
-(() => {
-  const $ = (id) => document.getElementById(id);
-  const state = { directory: '', recursive: false, directories: [], selectedDirectories: new Set(), expanded: new Set(), config: null, sessions: [], messages: [], sessionClient: 'all', selectedId: null, sessionRequest: 0, messageRequest: 0, events: null, debounce: null, toastTimer: null, loadingSessions: false };
-  const clients = { codex: 'Codex', claude: 'Claude' };
-  const statuses = { pending: '正在提交', submitted: '已提交', queued: '已排队', held: '已保留', unknown: '待确认', failed: '发送失败' };
-  const activityNames = { idle: '空闲', running: '工作中', waiting_permission: '等待权限', waiting_input: '等待答复', initializing: '正在初始化', unloaded: '未加载', offline: '离线', unknown: '状态待确认' };
-  const phaseNames = { interrupting: '暂停业务', writing_handoff: '保存交付文档', awaiting_handoff_end: '等待交付轮次结束', compacting: '原生压缩', restoring: '加载上文', awaiting_restore_end: '等待恢复轮次结束', needs_attention: '需要处理', user_intervened: '检测到用户介入', completed: '维护已完成', cancelled: '维护已取消' };
-  const liveStatusWarning = 'Codex history metadata does not report whether a conversation is currently running; live status is unknown.';
-
-  function singleLine(value, maxLength = 120) {
-    const line = String(value ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, ' ').replace(/\s+/g, ' ').trim();
-    return line.length > maxLength ? `${line.slice(0, maxLength - 1)}…` : line;
+import { addressOf, autoCompressEnabled, visibleAddresses, messageMatches, validThresholds, PolicySaver } from './ui-state.mjs';
+const $ = id => document.getElementById(id);
+const state = { config: null, directories: [], sessions: [], messages: [], openDirs: new Set(), openClients: new Set(), knownDirs: new Set(),
+  editors: new Map(), cards: new Map(), selected: null, messageRequest: 0, sessionRequest: 0, discoveryBusy: false, events: null, closed: false, signature: '', scope: '', messageTimer: null };
+const activities = { idle: '空闲', running: '工作中', waiting_permission: '等待权限', waiting_input: '等待答复', initializing: '初始化中', unloaded: '未加载', offline: '离线', unknown: '待确认' };
+const delivery = { submitted: '已提交', queued: '已排队', pending: '提交中', unknown: '待确认', failed: '发送失败', held: '已保留' };
+const phases = { interrupting: '正在暂停任务', writing_handoff: '保存交付文档', awaiting_handoff_end: '等待交付轮次结束', compacting: '正在压缩', restoring: '加载上文', awaiting_restore_end: '等待恢复轮次结束', needs_attention: '需要处理', user_intervened: '用户已介入', completed: '维护已完成', cancelled: '维护已取消' };
+function el(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = text; return node; }
+function button(text, className, action) { const node = el('button', className, text); node.type = 'button'; node.addEventListener('click', action); return node; }
+function notice(text) { $('global-error').textContent = text || ''; $('global-error').hidden = !text; }
+let toastTimer;
+function toast(text) { clearTimeout(toastTimer); $('toast').textContent = text; $('toast').hidden = false; toastTimer = setTimeout(() => $('toast').hidden = true, 3600); }
+function timestamp(value, full = false) {
+  if (!value || !Number.isFinite(Date.parse(value))) return '等待数据';
+  return new Intl.DateTimeFormat('zh-CN', full ? { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false } : { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }).format(new Date(value));
+}
+const name = session => session.name || '未命名会话';
+function label(session) { return session.client + '://' + name(session) + ':' + session.id; }
+function defaults(session) { return { softPercent: 50, hardPercent: 80, ...state.config.policyDefaults[session.client] }; }
+function effective(session) { const policy = session.policy; return { autoCompress: autoCompressEnabled(policy), ...defaults(session), softPercent: policy?.softPercent ?? defaults(session).softPercent, hardPercent: policy?.hardPercent ?? defaults(session).hardPercent }; }
+async function request(path, options = {}) {
+  const response = await fetch(path, { cache: 'no-store', ...options });
+  const data = await response.json();
+  if (!response.ok) throw Object.assign(new Error(data.error || '请求失败'), { status: response.status, policy: data.policy });
+  return data;
+}
+async function post(path, body, retried = false) {
+  try { return await request(path, { method:'POST', headers:{ 'Content-Type':'application/json', 'X-Coop-UI':state.config.csrfToken }, body:JSON.stringify(body) }); }
+  catch (error) {
+    if (error.status === 403 && !retried) { state.config = await request('/api/config'); return post(path, body, true); }
+    throw error;
   }
-
-  function sessionName(session) {
-    return singleLine(session?.name || '未命名会话');
-  }
-
-  function sessionStatus(session) {
-    if (session.monitoring?.runtime?.activity) return activityNames[session.monitoring.runtime.activity] || '状态待确认';
-    if (session.live) return '已打开';
-    if (session.status === 'offline' || session.status === 'closed') return '历史会话';
-    return '状态未知';
-  }
-
-  function element(tag, className, value) {
-    const node = document.createElement(tag);
-    if (className) node.className = className;
-    if (value !== undefined) node.textContent = String(value);
-    return node;
-  }
-
-  function address(participant) {
-    if (!participant) return '未知会话';
-    return `${singleLine(participant.client || 'unknown', 24)}://${sessionName(participant)}:${singleLine(participant.id || '', 100)}`;
-  }
-
-  function time(value, full = false) {
-    const date = new Date(value);
-    if (!value || !Number.isFinite(date.getTime())) return '时间未知';
-    return new Intl.DateTimeFormat('zh-CN', full ? { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false } : { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
-  }
-
-  async function request(path, options = {}) {
-    const response = await fetch(path, { ...options, headers: { Accept: 'application/json', ...options.headers }, cache: 'no-store' });
-    let data;
-    try { data = await response.json(); } catch { throw new Error(`服务返回了无法解析的响应（${response.status}）。`); }
-    if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : data.error?.message || data.message || `请求失败（${response.status}）。`);
-    return data;
-  }
-  const post = (path, value) => request(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Coop-UI': state.config.csrfToken }, body: JSON.stringify(value) });
-  function renderDirectories() {
-    $('directory-list').replaceChildren();
-    for (const directory of state.directories) {
-      const chip = element('div', 'directory-chip');
-      const label = element('label'); const input = element('input'); input.type = 'checkbox'; input.checked = state.selectedDirectories.has(directory.id);
-      input.addEventListener('change', () => { input.checked ? state.selectedDirectories.add(directory.id) : state.selectedDirectories.delete(directory.id); refreshAll(); });
-      label.append(input, element('span', '', directory.path), element('small', '', directory.recursive ? '含子目录' : '当前层'));
-      const remove = element('button', 'remove-directory', '×'); remove.type = 'button'; remove.setAttribute('aria-label', `移除目录 ${directory.path}`);
-      remove.addEventListener('click', async () => { try { const result = await post('/api/directories/remove', { id: directory.id }); state.directories = result.directories; state.selectedDirectories.delete(directory.id); renderDirectories(); refreshAll(); } catch (error) { showToast(error.message); } });
-      const controlLabel = element('label', 'directory-control'); const control = element('input'); control.type = 'checkbox'; control.checked = directory.claudeControlEnabled === true;
-      control.setAttribute('aria-label', `允许 ${directory.path} 的 Claude 控制接入`);
-      controlLabel.title = '仅精确匹配本目录；在已配置的官方启动器下，重开 Claude 会话后生效。';
-      controlLabel.append(control, document.createTextNode('Claude 控制'));
-      control.addEventListener('change', async () => { control.disabled = true; try { const result = await post('/api/directories/claude-control', { id: directory.id, enabled: control.checked }); state.directories = result.directories; renderDirectories(); showToast(result.detail); await loadSessions(); } catch (error) { control.checked = !control.checked; showToast(error.message); } finally { control.disabled = false; } });
-      chip.append(label, controlLabel, remove); $('directory-list').append(chip);
-    }
-    $('directory-scope').textContent = `已选择 ${state.selectedDirectories.size} / ${state.directories.length} 个目录 · 跨目录消息一并展示`;
-  }
-  function managementPanel(session) {
-    const details = element('details', 'management-panel'); details.open = state.expanded.has(session.address);
-    details.addEventListener('toggle', () => { details.open ? state.expanded.add(session.address) : state.expanded.delete(session.address); });
-    details.append(element('summary', '', '上下文管理'));
-    const usage = element('p', 'usage-line'); usage.dataset.field = 'usage';
-    const meta = element('p', 'runtime-meta'); meta.dataset.field = 'runtime';
-    const decision = element('p', 'decision-note'); decision.dataset.field = 'decision';
-    const read = element('button', 'text-button', '读取当前状态'); read.type = 'button';
-    read.addEventListener('click', async () => {
-      read.disabled = true; read.textContent = '正在读取…';
-      try { session.monitoring = await post('/api/runtime', { address: session.address, native: true }); updateManagement(); }
-      catch (error) { showToast(error.message); }
-      finally { read.disabled = false; read.textContent = '读取当前状态'; }
+}
+async function copy(value) { try { await navigator.clipboard.writeText(value); toast('已复制'); } catch { toast('复制失败，可直接选中会话 ID 复制。'); } }
+function editor(session) {
+  const key = addressOf(session);
+  if (state.editors.has(key)) return state.editors.get(key);
+  const value = { draft: effective(session), status:'saved', error:null, editing:false, dirty:false, version:0, saver:null };
+  value.saver = new PolicySaver(async (policy, revision) => (await post('/api/policies', { address:key, policy, expectedRevision:revision })).policy,
+    (status, item) => {
+      if (!value.dirty) { value.status = status; value.error = item.error?.message || null; }
+      if (item.error?.status === 409) {
+        value.saver.revision = item.error.policy?.revision || 0;
+        session.policy = item.error.policy;
+      }
+      if (item.policy) {
+        const current = state.sessions.find(s => addressOf(s) === key);
+        if (current) current.policy = item.policy;
+      }
+      refreshCards();
     });
-    const policy = { enabled: false, mode: 'observe', ...state.config.policyDefaults[session.client], ...session.policy };
-    const form = element('form', 'policy-form');
-    const enabled = element('input'); enabled.type = 'checkbox'; enabled.checked = policy.enabled;
-    const enabledLabel = element('label', 'policy-enabled'); enabledLabel.append(enabled, document.createTextNode('启用此会话'));
-    const mode = element('select'); mode.setAttribute('aria-label', `${sessionName(session)} 的管理模式`);
-    for (const [value, title] of [['observe', '只观察触发条件'], ['automatic', '自动维护']]) { const option = element('option', '', title); option.value = value; mode.append(option); }
-    mode.value = policy.mode;
-    const grid = element('div', 'policy-grid');
-    const fields = {};
-    for (const [key, title] of [['softPercent', '空闲阈值 %'], ['hardPercent', '强停阈值 %']]) {
-      const label = element('label', '', title); const input = element('input'); input.type = 'number'; input.min = '0.01'; input.max = '99.99'; input.step = '0.01'; input.required = true; input.value = policy[key];
-      input.setAttribute('aria-label', `${sessionName(session)} ${title}`); label.append(input); grid.append(label); fields[key] = input;
-    }
-    const save = element('button', 'button', '保存此会话策略'); save.type = 'submit';
-    form.append(enabledLabel, mode, grid, save);
-    form.addEventListener('submit', async event => {
-      event.preventDefault(); save.disabled = true;
-      try { const result = await post('/api/policies', { address: session.address, policy: { enabled: enabled.checked, mode: mode.value, softPercent: Number(fields.softPercent.value), hardPercent: Number(fields.hardPercent.value) } }); session.policy = result.policy; showToast('已保存，仅应用于此会话'); await loadMonitoring(); }
-      catch (error) { showToast(error.message); } finally { save.disabled = false; }
-    });
-    const controls = element('div', 'cycle-controls'); controls.dataset.field = 'cycle';
-    details.append(usage, meta, read, form, decision, controls); return details;
+  value.saver.revision = session.policy?.revision || 0; state.editors.set(key, value); return value;
+}
+function commit(session) {
+  const value = editor(session); value.editing = false;
+  if (!validThresholds(Number(value.draft.softPercent), Number(value.draft.hardPercent))) {
+    value.status = 'error'; value.error = '请输入 0 到 100 之间的数值，空闲阈值必须小于强停阈值。'; refreshCards(); return;
   }
-  function updateManagement() {
-    for (const item of $('session-list').children) {
-      const session = state.sessions.find(s => s.address === item.dataset.address); if (!session) continue;
-      const sample = session.monitoring, runtime = sample?.runtime, usage = sample?.usage;
-      const activityLabel = item.querySelector('[data-field="activity-label"]');
-      if (activityLabel) activityLabel.textContent = sessionStatus(session);
-      const used = Number.isFinite(usage?.usedTokens) ? usage.usedTokens.toLocaleString() : '—';
-      const capacity = usage?.contextWindowTokens > 0 ? usage.contextWindowTokens.toLocaleString() : '容量未知';
-      const percent = Number.isFinite(usage?.usedTokens) && usage?.contextWindowTokens > 0 ? (usage.usedTokens * 100 / usage.contextWindowTokens).toFixed(2) + '%' : '—';
-      item.querySelector('[data-field="usage"]').textContent = usage ? `${percent} · ${used} / ${capacity} tokens` : '尚未读取上下文';
-      item.querySelector('[data-field="runtime"]').textContent = runtime ? `${activityNames[runtime.activity] || '状态待确认'} · ${runtime.model || usage?.model || '模型待确认'}\n用量观测：${time(usage?.measuredAt || usage?.queriedAt, true)}` : '点击读取当前状态，查看原生会话的用量与活动状态。';
-      item.querySelector('[data-field="decision"]').textContent = sample?.error || (runtime && !runtime.connected ? runtime.detail : null) ||
-        (session.client === 'claude' && session.controlAccess?.directoryEnabled === false ? session.controlAccess.detail : null) || sample?.decision?.reason || '默认关闭；启用后可先观察触发条件。';
-      const controls = item.querySelector('[data-field="cycle"]'); controls.replaceChildren();
-      const cycle = session.cycle;
-      if (cycle) {
-        controls.append(element('p', 'cycle-phase', `${phaseNames[cycle.state] || cycle.state} · 排队 ${session.queueCount || 0} 条`));
-        if (cycle.reason) controls.append(element('p', 'cycle-reason', cycle.reason));
-        const actions = [['cancel-release', '取消维护并释放消息'], ['cancel-hold', '取消维护并保留消息']];
-        if (['needs_attention', 'user_intervened'].includes(cycle.state)) actions.unshift(['reconcile', '核对原生状态后继续']);
-        if (['writing_handoff', 'restoring'].includes(cycle.previousState) && ['needs_attention', 'user_intervened'].includes(cycle.state)) actions.unshift(['retry', '重新发送交付／恢复请求']);
-        else if (['not_submitted', 'failed'].includes(cycle.lastAttemptOutcome)) actions.unshift(['retry', '重试已失败步骤']);
-        for (const [action, title] of actions) {
-          const button = element('button', 'text-button', title); button.type = 'button';
-          button.addEventListener('click', async () => { button.disabled = true; try { await post('/api/cycles/action', { id: cycle.id, action }); await loadMonitoring(); await loadMessages({ silent: true }); } catch (error) { showToast(error.message); } finally { button.disabled = false; } }); controls.append(button);
+  value.draft.softPercent = Number(value.draft.softPercent); value.draft.hardPercent = Number(value.draft.hardPercent);
+  value.dirty = false; value.version++; void value.saver.save(value.draft); refreshCards();
+}
+function markDraft(session, key, next) { const value = editor(session); value.draft[key] = next; value.editing = true; value.dirty = true; value.status = 'editing'; value.error = null; }
+function buildCard(session) {
+  const key = addressOf(session), value = editor(session);
+  const card = el('section', 'session-card'); card.dataset.address = key; card.setAttribute('aria-label', name(session));
+  const head = el('div', 'session-head'), title = el('h3', 'session-name', name(session)), badge = el('span', 'activity-badge');
+  title.title = name(session); head.append(title, badge);
+  const identity = el('div', 'identity'); const id = el('code', '', session.id);
+  identity.append(id, button('复制地址', 'text-button copy-address', () => copy(label(session))));
+  const usage = el('div', 'usage-summary'), amount = el('strong', 'usage-number', '—'), info = el('div', 'usage-info'), tokens = el('span', 'token-count'), model = el('span', 'model-name');
+  info.append(tokens, model); usage.append(amount, info);
+  const meter = el('meter', 'usage-meter'); meter.min = 0; meter.max = 100; meter.setAttribute('aria-label', name(session) + ' 上下文占用');
+  const freshness = el('div','freshness');
+  const controls = el('div','compression-controls'), toggleLabel = el('label', 'auto-toggle'), toggle = el('input'); toggle.type='checkbox'; toggle.checked=value.draft.autoCompress;
+  toggle.setAttribute('aria-label', name(session) + ' 启用自动压缩');
+  toggle.addEventListener('change', () => { value.draft.autoCompress = toggle.checked; commit(session); });
+  toggleLabel.append(toggle, el('span','', '启用自动压缩'));
+  const saveStatus = el('span', 'save-status'); saveStatus.setAttribute('role','status'); controls.append(toggleLabel, saveStatus);
+  const fields = {};
+  for (const [field, caption, type] of [['softPercent', '空闲阈值', 'soft'], ['hardPercent', '强停阈值', 'hard']]) {
+    const row = el('div', 'threshold ' + type), top = el('div','threshold-top'), title = el('span','threshold-label', caption);
+    const numberLabel = el('label','threshold-value'), input = el('input');
+    input.type='number'; input.min='0.01'; input.max='99.99'; input.step='0.01'; input.inputMode='decimal'; input.value=value.draft[field];
+    input.setAttribute('aria-label', name(session) + ' ' + caption + ' 数值');
+    const range = el('input','threshold-range'); range.type='range'; range.min='0.01'; range.max='99.99'; range.step='0.01'; range.value=value.draft[field];
+    range.setAttribute('aria-label', name(session) + ' ' + caption + ' 滑动条');
+    input.addEventListener('focus', () => value.editing = true);
+    input.addEventListener('input', () => { markDraft(session, field, input.value === '' ? NaN : Number(input.value)); if (Number.isFinite(value.draft[field])) range.value = value.draft[field]; saveStatus.textContent='编辑中'; });
+    const finish = () => { if (value.dirty) commit(session); else value.editing=false; };
+    input.addEventListener('blur', finish); input.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); finish(); input.blur(); } });
+    range.addEventListener('input', () => {
+      const other = Number(value.draft[field === 'softPercent' ? 'hardPercent' : 'softPercent']);
+      const raw = Number(range.value), bounded = Number.isFinite(other) ? field === 'softPercent' ? Math.min(raw, other - .01) : Math.max(raw, other + .01) : raw;
+      const next = Math.max(.01, Math.min(99.99, Math.round(bounded * 100) / 100));
+      markDraft(session, field, next); input.value=next; range.value=next; saveStatus.textContent='松手后保存';
+    });
+    range.addEventListener('change', () => commit(session));
+    numberLabel.append(input,el('span','','%')); top.append(title,numberLabel); row.append(top,range); controls.append(row); fields[field]={input,range};
+  }
+  const note=el('p','policy-hint','达到空闲阈值，工作结束后压缩；达到强停阈值，先暂停再压缩。开启后降低阈值可能立即触发。');
+  const validation=el('div','policy-error'); validation.setAttribute('role','alert'); validation.hidden=true;
+  const retry=button('重新保存','text-button retry-save',()=>commit(session)); retry.hidden=true;
+  const cycle=el('div','cycle-controls');
+  controls.append(note,validation,retry); card.append(head,identity,usage,meter,freshness,controls,cycle);
+  const entry={card,badge,amount,tokens,model,meter,freshness,toggle,saveStatus,fields,validation,retry,cycle,cycleSignature:''};
+  if(!state.cards.has(key))state.cards.set(key,[]);state.cards.get(key).push(entry);
+  return card;
+}
+function refreshCards() {
+  let automatic=0;
+  for(const session of state.sessions) {
+    const key=addressOf(session), value=editor(session), sample=session.monitoring, runtime=sample?.runtime, usage=sample?.usage;
+    if(autoCompressEnabled(session.policy))automatic++;
+    const hasCount=Number.isFinite(usage?.usedTokens), percent=hasCount&&usage.contextWindowTokens>0?usage.usedTokens*100/usage.contextWindowTokens:null;
+    for(const card of state.cards.get(key)||[]) {
+      const activity=runtime?.activity || (session.live?'initializing':'unknown');
+      card.badge.textContent=activities[activity]||'待确认'; card.badge.className='activity-badge '+activity;
+      card.amount.textContent=percent===null?'—':percent.toFixed(1)+'%';
+      card.amount.className='usage-number '+(percent!==null&&percent>=Number(value.draft.hardPercent)?'high':percent!==null&&percent>=Number(value.draft.softPercent)?'warm':'');
+      card.tokens.textContent=hasCount?usage.usedTokens.toLocaleString()+' / '+(usage.contextWindowTokens>0?usage.contextWindowTokens.toLocaleString():'容量未知')+' tokens':'等待上下文用量';
+      card.model.textContent=runtime?.model||usage?.model||'模型待确认';
+      card.meter.value=percent===null?0:Math.min(100,percent);card.meter.low=Number(value.draft.softPercent)||50;card.meter.high=Number(value.draft.hardPercent)||80;card.meter.optimum=0;card.meter.hidden=percent===null;
+      card.freshness.textContent=runtime?.connected?(usage?.historyChangedAfterMeasurement?'等待本轮新统计 · ':'最近统计 ')+timestamp(usage?.measuredAt||usage?.queriedAt||usage?.observedAt)
+        : (usage?'离线快照 · '+timestamp(usage.measuredAt||usage.observedAt):session.client==='claude'&&session.controlAccess?.directoryEnabled===false?'未接入 Claude 控制，等待可用记录':'等待客户端连接');
+      card.toggle.checked=Boolean(value.draft.autoCompress);
+      if(!value.editing) for(const field of ['softPercent','hardPercent']) {
+        const control=card.fields[field]; if(document.activeElement!==control.input&&document.activeElement!==control.range) {
+          control.input.value=Number.isFinite(Number(value.draft[field]))?value.draft[field]:'';control.range.value=value.draft[field];
         }
-      } else if (session.queueCount > 0) controls.append(element('p', 'cycle-phase', `待处理消息 ${session.queueCount} 条`));
-      else if (session.lastCycle) controls.append(element('p', 'cycle-phase', phaseNames[session.lastCycle.state] || session.lastCycle.state));
-      if (session.queueState?.held) {
-        const release = element('button', 'text-button', `释放 ${session.queueState.held} 条保留消息`); release.type = 'button';
-        release.addEventListener('click', async () => { try { await post('/api/queue/release', { address: session.address }); await loadMonitoring(); loadMessages({ silent: true }); } catch (error) { showToast(error.message); } }); controls.append(release);
+      }
+      card.saveStatus.textContent=({saving:'保存中…',saved:'已保存',editing:'编辑中',error:'保存失败'})[value.status]||'';
+      card.saveStatus.className='save-status '+value.status;card.validation.hidden=!value.error;card.validation.textContent=value.error||'';card.retry.hidden=value.status!=='error';
+      const cycle=session.cycle; const signature=JSON.stringify([cycle,session.lastCycle?.id,session.queueCount,session.queueState]);
+      if(signature!==card.cycleSignature) {
+        card.cycleSignature=signature;card.cycle.replaceChildren();
+        if(cycle) {
+          card.cycle.append(el('p','cycle-title',(phases[cycle.state]||cycle.state)+' · 排队 '+(session.queueCount||0)+' 条'));
+          if(cycle.reason)card.cycle.append(el('p','cycle-reason',cycle.reason));
+          const actions=[];
+          if(['needs_attention','user_intervened'].includes(cycle.state)) {
+            actions.push(['reconcile','核对后继续']);
+            if(['writing_handoff','restoring'].includes(cycle.previousState))actions.push(['retry','重发当前请求']);
+          }
+          actions.push(['cancel-release','取消并释放消息'],['cancel-hold','取消并保留消息']);
+          for(const [action,text]of actions)card.cycle.append(button(text,'text-button',async event=>{
+            const target=event.currentTarget;target.disabled=true;
+            try{await post('/api/cycles/action',{id:cycle.id,action});await loadMonitoring();await loadMessages();}
+            catch(error){toast(error.message);}finally{target.disabled=false;}
+          }));
+        } else if(session.lastCycle) card.cycle.append(el('span','last-cycle',(phases[session.lastCycle.state]||session.lastCycle.state)+(session.queueCount?' · 待处理 '+session.queueCount+' 条':'')));
+        if(session.queueState?.held)card.cycle.append(button('释放保留消息','text-button',async()=>{try{await post('/api/queue/release',{address:key});await loadMonitoring();await loadMessages();}catch(error){toast(error.message);}}));
       }
     }
   }
-  async function loadMonitoring() {
-    try {
-      const result = await request('/api/monitoring');
-      for (const sample of result.sessions) {
-        const session = state.sessions.find(s => s.client === sample.session.client && s.id === sample.session.id);
-        if (session) { session.monitoring = sample; session.policy = sample.policy; session.cycle = sample.cycle; session.lastCycle = sample.lastCycle; session.queueCount = sample.queueCount; session.queueState = sample.queueState; }
-      }
-      updateManagement();
-    } catch { /* The connection banner already reports service disconnection. */ }
-  }
-
-  function showToast(message) {
-    clearTimeout(state.toastTimer);
-    $('toast').textContent = message;
-    $('toast').hidden = false;
-    state.toastTimer = setTimeout(() => { $('toast').hidden = true; }, 2600);
-  }
-
-  async function copy(text, label) {
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const input = element('textarea');
-        input.value = text;
-        input.setAttribute('readonly', '');
-        input.style.position = 'fixed';
-        input.style.opacity = '0';
-        document.body.append(input);
-        input.select();
-        const ok = document.execCommand('copy');
-        input.remove();
-        if (!ok) throw new Error('copy failed');
-      }
-      showToast(`已复制${label}`);
-    } catch { showToast('复制未成功，请选中文本后手动复制。'); }
-  }
-
-  function empty(id, title, description, error = false) {
-    const node = $(id);
-    node.hidden = false;
-    node.classList.toggle('error', error);
-    node.querySelector('p').textContent = title;
-    node.querySelector('span').textContent = description;
-  }
-
-  function setGlobalError(message) {
-    $('global-error').textContent = message || '';
-    $('global-error').hidden = !message;
-  }
-
-  function badge(status) {
-    const safeStatus = Object.hasOwn(statuses, status) ? status : 'unknown';
-    return element('span', `status-badge ${safeStatus}`, statuses[safeStatus]);
-  }
-
-  function renderSessions() {
-    const query = $('session-search').value.trim().toLocaleLowerCase();
-    const sessions = state.sessions.filter((session) => (state.sessionClient === 'all' || session.client === state.sessionClient) && `${session.name || ''} ${session.id || ''}`.toLocaleLowerCase().includes(query));
-    $('session-count').textContent = String(sessions.length);
-    $('session-list').replaceChildren();
-    $('session-list').hidden = sessions.length === 0;
-    $('session-state').hidden = sessions.length > 0;
-    if (!sessions.length) {
-      const filtered = query || state.sessionClient !== 'all';
-      empty('session-state', filtered ? '没有匹配的会话' : '这个目录还没有会话', filtered ? '尝试其他名称、ID 或客户端。' : '在 Codex 或 Claude Code 中打开此项目的对话，然后刷新。');
-      return;
-    }
-    const fragment = document.createDocumentFragment();
-    for (const session of sessions) {
-      const item = element('li', 'session-item');
-      item.dataset.address = session.address;
-      const titleRow = element('div', 'session-title-row');
-      const icon = element('span', `client-icon${session.client === 'claude' ? ' claude' : ''}`, session.client === 'claude' ? '✳' : '⌘');
-      icon.setAttribute('aria-hidden', 'true');
-      const title = element('h3', 'session-title', sessionName(session));
-      title.title = sessionName(session);
-      titleRow.append(icon, title);
-      if (session.live) { const dot = element('span', 'live-dot'); dot.title = '已打开'; dot.setAttribute('aria-label', '已打开'); titleRow.append(dot); }
-      const meta = element('div', 'session-meta');
-      const activity = element('span', '', sessionStatus(session)); activity.dataset.field = 'activity-label';
-      meta.append(element('span', '', clients[session.client] || singleLine(session.client, 24)), element('span', '', '·'), activity);
-      meta.title = singleLine(session.cwd, 240);
-      const id = element('code', 'session-id', session.id || '');
-      id.title = singleLine(session.id, 100);
-      const actions = element('div', 'session-actions');
-      const copyAddress = element('button', 'copy-address', '复制通信地址');
-      copyAddress.type = 'button';
-      copyAddress.title = singleLine(address(session), 300);
-      copyAddress.setAttribute('aria-label', `复制 ${sessionName(session)} 的通信地址`);
-      copyAddress.addEventListener('click', () => copy(`${singleLine(session.client, 24)}://${sessionName(session)}:${session.id}`, '通信地址'));
-      const copyId = element('button', 'copy-id', '复制 ID');
-      copyId.type = 'button';
-      copyId.setAttribute('aria-label', `复制 ${sessionName(session)} 的会话 ID`);
-      copyId.addEventListener('click', () => copy(session.id, '会话 ID'));
-      actions.append(copyAddress, copyId);
-      item.append(titleRow, meta, id, actions, managementPanel(session));
-      fragment.append(item);
-    }
-    $('session-list').append(fragment);
-    updateManagement();
-  }
-
-  function resetDetail() {
-    const placeholder = element('div', 'detail-placeholder');
-    const mark = element('div', 'detail-placeholder-mark', '↗');
-    mark.setAttribute('aria-hidden', 'true');
-    mark.append(element('span', '', '↙'));
-    placeholder.append(mark, element('h3', '', '每一次交接，都有记录'), element('p', '', '选择一条消息，查看完整内容、发送方与接收方。'), element('span', 'privacy-note', '仅展示经本工具传递的消息'));
-    $('message-detail').replaceChildren(placeholder);
-  }
-
-  function renderDetail(message) {
-    if (!message) { resetDetail(); return; }
-    const content = element('div', 'detail-content');
-    const top = element('div', 'detail-top');
-    top.append(element('h3', '', '消息详情'), badge(message.status));
-    const metadata = element('dl', 'detail-meta');
-    for (const [label, value, className] of [['发送方', address(message.from), ''], ['接收方', address(message.to), ''], ['发送时间', time(message.createdAt, true), ''], ['消息 ID', message.id, 'monospace']]) {
-      const row = element('div');
-      row.append(element('dt', '', label), element('dd', className, value));
-      metadata.append(row);
-    }
-    const body = element('pre', 'detail-body', message.text || '（空消息）');
-    content.append(top, metadata, body);
-    if (message.error) content.append(element('div', 'detail-error', typeof message.error === 'string' ? message.error : JSON.stringify(message.error)));
-    const copyMessage = element('button', 'copy-address detail-copy', '复制消息内容');
-    copyMessage.type = 'button';
-    copyMessage.addEventListener('click', () => copy(message.text || '', '消息内容'));
-    content.append(copyMessage);
-    const notes = { submitted: '已提交到目标客户端；此状态不代表对方已阅读或处理。', queued: '消息已持久排队，维护完成后按顺序投递。', held: '消息按用户选择保留，等待在会话管理中释放。', pending: '正在向目标客户端提交消息。', unknown: '投递结果尚未确认。核对目标会话后，可选择以下处理方式。', failed: '消息发送失败，原因见上方记录。' };
-    content.append(element('p', 'delivery-note', notes[message.status] || notes.unknown));
-    if (message.detail) content.append(element('p', 'delivery-note', message.detail));
-    if (message.status === 'unknown') {
-      for (const [outcome, title] of [['submitted', '确认已送达，继续队列'], ['not_submitted', '确认未送达，重新发送']]) {
-        const button = element('button', 'button resolve-message', title); button.type = 'button';
-        button.addEventListener('click', async () => { button.disabled = true; try { await post('/api/messages/resolve', { id: message.id, outcome }); await loadMessages(); await loadMonitoring(); } catch (error) { showToast(error.message); } finally { button.disabled = false; } }); content.append(button);
-      }
-    }
-    $('message-detail').replaceChildren(content);
-  }
-
-  function selectMessage(message) {
-    state.selectedId = message.id;
-    for (const button of $('message-list').querySelectorAll('button[data-id]')) {
-      const selected = button.dataset.id === String(message.id);
-      button.classList.toggle('selected', selected);
-      button.setAttribute('aria-pressed', String(selected));
-    }
-    renderDetail(message);
-  }
-
-  function renderMessages(total) {
-    $('message-count').textContent = String(total ?? state.messages.length);
-    $('history-summary').textContent = total > state.messages.length ? `显示最近 ${state.messages.length} 条，共 ${total} 条；名称保留发送时的记录。` : '消息中的会话名称保留发送时的记录。';
-    $('message-list').replaceChildren();
-    $('message-list').hidden = state.messages.length === 0;
-    $('message-state').hidden = state.messages.length > 0;
-    if (!state.messages.length) {
-      const filtered = $('message-search').value.trim() || $('message-client').value !== 'all';
-      empty('message-state', filtered ? '没有匹配的消息' : '还没有通信记录', filtered ? '调整搜索词或客户端筛选后重试。' : 'agent 通过此工具发送消息后，记录会自动显示在这里。');
-      state.selectedId = null;
-      resetDetail();
-      return;
-    }
-    const fragment = document.createDocumentFragment();
-    for (const message of state.messages) {
-      const row = element('li');
-      const button = element('button', 'message-row');
-      button.type = 'button';
-      button.dataset.id = String(message.id);
-      button.setAttribute('aria-pressed', String(state.selectedId === message.id));
-      button.classList.toggle('selected', state.selectedId === message.id);
-      button.setAttribute('aria-label', `${address(message.from)} 发送给 ${address(message.to)}，${time(message.createdAt, true)}`);
-      const top = element('div', 'message-row-top');
-      const stamp = element('time', 'message-time', time(message.createdAt));
-      const date = new Date(message.createdAt);
-      if (Number.isFinite(date.getTime())) stamp.dateTime = date.toISOString();
-      top.append(stamp, badge(message.status));
-      const from = element('div', 'message-route', address(message.from));
-      from.title = singleLine(address(message.from), 300);
-      const to = element('div', 'message-route to', `→ ${address(message.to)}`);
-      to.title = singleLine(address(message.to), 300);
-      button.append(top, from, to, element('p', 'message-preview', message.text || '（空消息）'));
-      button.addEventListener('click', () => selectMessage(message));
-      row.append(button);
-      fragment.append(row);
-    }
-    $('message-list').append(fragment);
-    const selected = state.messages.find((message) => message.id === state.selectedId);
-    if (selected) renderDetail(selected);
-    else { state.selectedId = null; resetDetail(); }
-  }
-
-  async function loadSessions() {
-    const requestId = ++state.sessionRequest;
-    state.loadingSessions = true;
-    $('load-directory').disabled = true;
-    $('refresh-all').disabled = true;
-    $('session-list').hidden = true;
-    $('sessions-title').setAttribute('aria-busy', 'true');
-    empty('session-state', '正在载入会话', '读取此目录的本地会话信息…');
-    $('warnings').hidden = true;
-    $('session-status-note').hidden = true;
-    try {
-      const result = await post('/api/sessions', { directoryIds: [...state.selectedDirectories] });
-      if (requestId !== state.sessionRequest) return;
-      state.sessions = Array.isArray(result.sessions) ? result.sessions : [];
-      renderSessions();
-      const allWarnings = Array.isArray(result.warnings) ? result.warnings.map((warning) => typeof warning === 'string' ? warning : warning.message || JSON.stringify(warning)) : [];
-      const warnings = allWarnings.filter((warning) => warning !== liveStatusWarning);
-      $('session-status-note').hidden = !allWarnings.includes(liveStatusWarning) && !state.sessions.some((session) => session.client === 'codex' && !session.live && session.status === 'unknown');
-      $('warnings').textContent = warnings.join('\n');
-      $('warnings').hidden = warnings.length === 0;
-    } catch (error) {
-      if (requestId !== state.sessionRequest) return;
-      state.sessions = [];
-      $('session-count').textContent = '0';
-      $('session-list').hidden = true;
-      empty('session-state', '无法载入会话', error.message, true);
-    } finally {
-      if (requestId === state.sessionRequest) {
-        state.loadingSessions = false;
-        $('load-directory').disabled = false;
-        $('refresh-all').disabled = false;
-        $('sessions-title').removeAttribute('aria-busy');
-      }
-    }
-  }
-
-  async function loadMessages({ silent = false } = {}) {
-    if (!state.config) return;
-    const requestId = ++state.messageRequest;
-    if (!silent && !state.messages.length) empty('message-state', '正在载入通信记录', '读取本地通信记录…');
-    $('message-error').hidden = true;
-    $('messages-title').setAttribute('aria-busy', 'true');
-    const query = new URLSearchParams({ directoryIds: JSON.stringify([...state.selectedDirectories]), q: $('message-search').value.trim(), client: $('message-client').value });
-    try {
-      const result = await request(`/api/messages?${query}`);
-      if (requestId !== state.messageRequest) return;
-      state.messages = Array.isArray(result.messages) ? result.messages : [];
-      renderMessages(result.total);
-    } catch (error) {
-      if (requestId !== state.messageRequest) return;
-      if (state.messages.length) {
-        $('message-error').textContent = `更新失败：${error.message}`;
-        $('message-error').hidden = false;
-      } else { empty('message-state', '无法载入通信记录', error.message, true); }
-    } finally { if (requestId === state.messageRequest) $('messages-title').removeAttribute('aria-busy'); }
-  }
-
-  async function loadDirectory(directory) {
-    if (!directory) return;
-    setGlobalError('');
-    try {
-      const result = await post('/api/directories', { path: directory, recursive: $('recursive').checked });
-      state.directories = result.directories; state.selectedDirectories.add(result.directory.id);
-      $('directory').value = ''; await refreshAll();
-    } catch (error) { setGlobalError(error.message); }
-  }
-  async function refreshAll() {
-    renderDirectories();
-    await Promise.allSettled([loadSessions(), loadMessages()]);
-    await loadMonitoring();
-  }
-
-  function connectEvents() {
-    if (!window.EventSource) { $('connection-label').textContent = '已连接 · 请手动刷新'; return; }
-    state.events = new EventSource('/api/events');
-    state.events.addEventListener('open', async () => {
-      $('connection-dot').className = 'status-dot connected'; $('connection-label').textContent = '本地服务已连接'; document.querySelector('.realtime-indicator').hidden = false;
-      try { const fresh = await request('/api/config'); state.config = { ...state.config, ...fresh }; } catch {}
+  $('auto-count').textContent=automatic;$('total-sessions').textContent=state.sessions.length;
+}
+function rememberTree() { try { localStorage.setItem('cooperation-tree-v1',JSON.stringify({dirs:[...state.openDirs],clients:[...state.openClients],known:[...state.knownDirs]})); } catch {} }
+function visible() { return visibleAddresses(state.directories,state.sessions,state.openDirs,state.openClients,$('session-search').value); }
+function updateScope() {
+  const addresses=[...visible()].sort(),signature=JSON.stringify(addresses);
+  $('session-count').textContent=addresses.length;
+  $('message-scope').textContent=addresses.length?'涉及左侧已展开的 '+addresses.length+' 个会话 · 发送或接收均计入':'尚未展开会话 · 展开目录和客户端后显示通信';
+  if(signature!==state.scope) { state.scope=signature; state.selected=null; state.messages=[];renderMessages();void loadMessages(); }
+}
+function renderTree() {
+  const previousScroll=$('directory-tree').scrollTop;
+  state.cards.clear();$('directory-tree').replaceChildren();
+  const query=$('session-search').value.trim().toLocaleLowerCase();
+  for(const directory of state.directories) {
+    const folder=el('section','directory-node'), heading=el('div','directory-heading');
+    const display=directory.label&&directory.label!==directory.path?directory.label:directory.path.replaceAll('\\','/').split('/').filter(Boolean).at(-1);
+    const title=button('', 'folder-toggle',()=>{
+      const open=!state.openDirs.has(directory.id);if(open)state.openDirs.add(directory.id);else state.openDirs.delete(directory.id);
+      title.setAttribute('aria-expanded',String(open));children.hidden=!open;rememberTree();updateScope();
     });
-    state.events.addEventListener('error', () => { $('connection-dot').className = 'status-dot disconnected'; $('connection-label').textContent = '正在重新连接'; document.querySelector('.realtime-indicator').hidden = true; });
-    let eventDebounce;
-    state.events.addEventListener('message', () => { clearTimeout(eventDebounce); eventDebounce = setTimeout(() => loadMessages({ silent: true }), 180); });
-    let managementDebounce;
-    state.events.addEventListener('management', () => { clearTimeout(managementDebounce); managementDebounce = setTimeout(loadMonitoring, 200); });
-  }
-
-  $('directory-form').addEventListener('submit', (event) => { event.preventDefault(); if (state.config) loadDirectory($('directory').value.trim()); });
-  $('refresh-all').addEventListener('click', refreshAll);
-  $('session-search').addEventListener('input', () => { if (!state.loadingSessions) renderSessions(); });
-  $('session-filters').addEventListener('click', (event) => {
-    const button = event.target.closest('button[data-client]');
-    if (!button) return;
-    state.sessionClient = button.dataset.client;
-    for (const item of $('session-filters').querySelectorAll('button')) item.setAttribute('aria-pressed', String(item === button));
-    if (!state.loadingSessions) renderSessions();
-  });
-  $('message-search').addEventListener('input', () => { clearTimeout(state.debounce); state.debounce = setTimeout(() => loadMessages(), 250); });
-  $('message-client').addEventListener('change', () => { clearTimeout(state.debounce); loadMessages(); });
-  let monitoringTimer;
-  window.addEventListener('pagehide', () => { state.events?.close(); clearInterval(monitoringTimer); });
-
-  async function initialize() {
-    $('load-directory').disabled = true;
-    try {
-      state.config = await request('/api/config');
-      $('version').textContent = state.config.version ? `v${state.config.version}` : '';
-      $('connection-dot').className = 'status-dot connected';
-      $('connection-label').textContent = '本地服务已连接';
-      $('load-directory').disabled = false;
-      connectEvents();
-      state.directories = state.config.directories || [];
-      state.selectedDirectories = new Set(state.directories.map(directory => directory.id));
-      await refreshAll(); monitoringTimer = setInterval(loadMonitoring, 5000);
-    } catch (error) {
-      $('connection-dot').className = 'status-dot disconnected';
-      $('connection-label').textContent = '服务未连接';
-      setGlobalError(`无法连接本地管理服务：${error.message} 请确认服务已启动后刷新页面。`);
-      empty('session-state', '本地服务尚未连接', '启动服务后刷新此页面。', true);
-      empty('message-state', '暂时无法读取记录', '启动服务后刷新此页面。', true);
+    title.setAttribute('aria-expanded',String(state.openDirs.has(directory.id)));title.setAttribute('aria-label','展开目录 '+directory.path);
+    const text=el('span','folder-text');text.append(el('strong','',display),el('small','',directory.path));
+    title.append(el('span','chevron','›'),el('span','folder-symbol','▰'),text,el('span','count',String(state.sessions.filter(s=>s.directoryIds?.includes(directory.id)).length)));
+    const remove=button('×','icon-button remove-directory',async()=>{
+      try{const result=await post('/api/directories/remove',{id:directory.id});state.directories=result.directories;state.openDirs.delete(directory.id);rememberTree();await loadSessions(true);}
+      catch(error){toast(error.message);}
+    });remove.setAttribute('aria-label','移除目录 '+directory.path);
+    heading.append(title,remove);folder.append(heading);
+    const children=el('div','directory-children');children.hidden=!state.openDirs.has(directory.id);
+    const options=el('div','directory-options'), controlLabel=el('label'), control=el('input');control.type='checkbox';control.checked=directory.claudeControlEnabled===true;
+    control.setAttribute('aria-label','允许 '+directory.path+' 的 Claude 控制接入');
+    control.addEventListener('change',async()=>{
+      control.disabled=true;try{const result=await post('/api/directories/claude-control',{id:directory.id,enabled:control.checked});state.directories=result.directories;toast(result.detail);await loadSessions(true);}
+      catch(error){control.checked=!control.checked;toast(error.message);}finally{control.disabled=false;}
+    });
+    controlLabel.append(control,document.createTextNode('Claude 控制'));controlLabel.title='允许本目录的 Claude 控制接入，重开面板生效；与自动压缩开关独立。';
+    options.append(controlLabel,el('span','',directory.recursive?'含子目录':'仅当前目录'));children.append(options);
+    if(directory.error)children.append(el('p','directory-error',directory.error));
+    for(const client of ['claude','codex']) {
+      const groupKey=directory.id+':'+client, group=el('section','client-node '+client);
+      const sessions=state.sessions.filter(s=>s.client===client&&s.directoryIds?.includes(directory.id)&&(!query||(name(s)+' '+s.id).toLocaleLowerCase().includes(query)));
+      const toggle=button('','client-toggle',()=>{
+        const open=!state.openClients.has(groupKey);if(open)state.openClients.add(groupKey);else state.openClients.delete(groupKey);
+        toggle.setAttribute('aria-expanded',String(open));list.hidden=!open;rememberTree();updateScope();
+      });
+      toggle.setAttribute('aria-label','展开 '+display+' 的 '+(client==='claude'?'Claude':'Codex'));toggle.setAttribute('aria-expanded',String(state.openClients.has(groupKey)));
+      toggle.append(el('span','chevron','›'),el('span','client-mark',client==='claude'?'✳':'⌘'),el('strong','',client==='claude'?'Claude':'Codex'),el('span','count',String(sessions.length)));
+      const list=el('div','client-sessions');list.hidden=!state.openClients.has(groupKey);
+      if(!sessions.length)list.append(el('p','group-empty',query?'没有匹配会话':'尚未发现会话'));
+      for(const session of sessions)list.append(buildCard(session));
+      group.append(toggle,list);children.append(group);
     }
+    folder.append(children);$('directory-tree').append(folder);
   }
-
-  initialize();
-})();
+  $('tree-empty').hidden=state.directories.length>0;$('tree-empty').textContent='添加项目目录，开始查看会话和上下文。';
+  $('directory-tree').scrollTop=previousScroll;refreshCards();updateScope();
+}
+function newDirectories(directories) {
+  state.directories=directories;
+  for(const d of directories)if(!state.knownDirs.has(d.id)) {
+    state.knownDirs.add(d.id);state.openDirs.add(d.id);state.openClients.add(d.id+':claude');state.openClients.add(d.id+':codex');
+  }
+}
+async function loadSessions(force=false) {
+  if(state.discoveryBusy)return;
+  state.discoveryBusy=true;const id=++state.sessionRequest;
+  try{
+    const dirs=await request('/api/directories');newDirectories(dirs.directories);
+    const result=await post('/api/sessions',{directoryIds:state.directories.map(d=>d.id)});
+    if(id!==state.sessionRequest||state.closed)return;
+    for(const session of result.sessions) {
+      const existing=state.sessions.find(s=>addressOf(s)===addressOf(session));
+      if(existing) {
+        session.monitoring=existing.monitoring||session.monitoring;
+        if((session.policy?.revision||0)<(existing.policy?.revision||0))session.policy=existing.policy;
+      }
+      const value=state.editors.get(addressOf(session));
+      if(value&&!value.editing&&!value.saver.running&&value.status!=='error') {
+        value.draft=effective(session);value.saver.revision=session.policy?.revision||0;
+      }
+    }
+    state.sessions=result.sessions;
+    for(const d of state.directories)d.error=result.directories?.find(r=>r.id===d.id)?.error;
+    const signature=JSON.stringify([state.directories,state.sessions.map(s=>[s.client,s.id,s.name,s.directoryIds])]);
+    if(force||signature!==state.signature){state.signature=signature;renderTree();}
+    await loadMonitoring();notice('');
+  }catch(error){notice('发现会话失败：'+error.message);}
+  finally{state.discoveryBusy=false;}
+}
+async function loadMonitoring() {
+  if(state.closed)return;
+  try {
+    const result=await request('/api/monitoring');
+    for(const sample of result.sessions) {
+      const session=state.sessions.find(s=>addressOf(s)===addressOf(sample.session));if(!session)continue;
+      if((sample.policy?.revision||0)<(session.policy?.revision||0))sample.policy=session.policy;
+      session.monitoring=sample;session.policy=sample.policy;session.cycle=sample.cycle;session.lastCycle=sample.lastCycle;session.queueCount=sample.queueCount;session.queueState=sample.queueState;
+      const value=state.editors.get(addressOf(session));
+      if(value&&!value.editing&&!value.saver.running&&value.status!=='error') {value.draft=effective(session);value.saver.revision=sample.policy?.revision||0;}
+    }
+    refreshCards();
+  }catch{ /* The service connection indicator handles disconnection. */ }
+}
+function statusBadge(status) { return el('span','delivery-badge '+status,delivery[status]||'待确认'); }
+function routePart(session, direction) {
+  const row=el('div','message-route'), badge=el('span','route-client '+session.client,session.client==='claude'?'Claude':'Codex');
+  row.append(el('span','route-direction',direction),badge,el('strong','',name(session)));row.title=label(session);return row;
+}
+function renderDetail(message) {
+  const panel=$('message-detail');panel.replaceChildren();panel.classList.toggle('has-selection',Boolean(message));
+  if(!message) {const empty=el('div','detail-empty');empty.append(el('span','detail-symbol','↗'),el('h3','','选择一条通信'),el('p','','查看完整正文、发送方和接收方。'));panel.append(empty);return;}
+  const head=el('div','detail-heading');head.append(el('h3','','消息详情'),statusBadge(message.status));
+  const meta=el('dl','detail-meta');
+  for(const [title,value]of [['发送方',label(message.from)],['接收方',label(message.to)],['发送时间',timestamp(message.createdAt,true)],['消息 ID',message.id]]) {
+    const row=el('div');row.append(el('dt','',title),el('dd','',value));meta.append(row);
+  }
+  panel.append(head,meta,el('pre','message-body',message.text),button('复制消息正文','button',()=>copy(message.text)));
+  if(message.error)panel.append(el('p','notice error',message.error));
+  if(message.detail)panel.append(el('p','detail-note',message.detail));
+  panel.append(el('p','detail-note',message.status==='submitted'?'已提交到原生客户端；不代表对方已处理。':message.status==='queued'?'消息已持久排队，将在维护完成后按顺序投递。':''));
+  if(message.status==='unknown')for(const [outcome,title]of [['submitted','确认已送达，继续队列'],['not_submitted','确认未送达，重新发送']])
+    panel.append(button(title,'button',async()=>{try{await post('/api/messages/resolve',{id:message.id,outcome});await loadMessages();}catch(error){toast(error.message);}}));
+}
+function renderMessages() {
+  const addresses=visible(),query=$('message-search').value.trim().toLocaleLowerCase(),filter=$('message-status').value;
+  const messages=state.messages.filter(m=>messageMatches(m,addresses)&&(filter==='all'||m.status===filter)&&(!query||[m.text,label(m.from),label(m.to)].some(t=>t.toLocaleLowerCase().includes(query))));
+  $('message-count').textContent=messages.length;$('message-list').replaceChildren();$('message-empty').hidden=messages.length>0;
+  $('message-empty').replaceChildren(el('span','empty-symbol','⇄'),el('h3','',addresses.size?'没有匹配的通信':'展开会话，聚焦通信'),el('p','',addresses.size?'当前展开会话暂时没有符合筛选条件的消息。':'展开左侧目录下的 Claude 或 Codex，会自动显示涉及这些会话的发送与接收记录。'));
+  for(const message of messages) {
+    const li=el('li'),row=button('','message-row',()=>{state.selected=message.id;renderMessages();});
+    row.setAttribute('aria-label',name(message.from)+' → '+name(message.to)+' '+timestamp(message.createdAt,true));row.setAttribute('aria-pressed',String(state.selected===message.id));
+    const top=el('div','message-row-top');top.append(el('time','',timestamp(message.createdAt,true)),statusBadge(message.status));
+    row.append(top,routePart(message.from,'从'),routePart(message.to,'到'),el('p','message-preview',message.text));li.append(row);$('message-list').append(li);
+  }
+  const selected=messages.find(m=>m.id===state.selected);if(!selected)state.selected=null;renderDetail(selected);
+}
+async function loadMessages() {
+  const id=++state.messageRequest,addresses=[...visible()];
+  if(!addresses.length){state.messages=[];renderMessages();return;}
+  try {
+    const result=await request('/api/messages?'+new URLSearchParams({addresses:JSON.stringify(addresses)}));
+    if(id!==state.messageRequest||state.closed)return;state.messages=result.messages;renderMessages();$('message-error').hidden=true;
+  }catch(error){if(id===state.messageRequest){$('message-error').textContent=error.message;$('message-error').hidden=false;}}
+}
+function connectEvents() {
+  state.events=new EventSource('/api/events');
+  state.events.addEventListener('open',()=>{$('connection-dot').className='dot connected';$('connection-label').textContent='本地服务在线';});
+  state.events.addEventListener('error',()=>{$('connection-dot').className='dot disconnected';$('connection-label').textContent='服务连接中断';});
+  let monitorTimer;
+  state.events.addEventListener('management',()=>{if(!monitorTimer)monitorTimer=setTimeout(()=>{monitorTimer=null;void loadMonitoring();},250);});
+  state.events.addEventListener('message',()=>{clearTimeout(state.messageTimer);state.messageTimer=setTimeout(loadMessages,200);});
+}
+$('directory-form').addEventListener('submit',async event=>{
+  event.preventDefault();const path=$('directory').value.trim();if(!path)return;$('add-directory').disabled=true;
+  try{const result=await post('/api/directories',{path,recursive:$('recursive').checked});newDirectories(result.directories);$('directory').value='';await loadSessions(true);}
+  catch(error){notice(error.message);}finally{$('add-directory').disabled=false;}
+});
+$('refresh-all').addEventListener('click',()=>loadSessions(true));
+$('collapse-all').addEventListener('click',()=>{state.openDirs.clear();rememberTree();renderTree();});
+let searchTimer;
+$('session-search').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(renderTree,150);});
+$('message-search').addEventListener('input',renderMessages);$('message-status').addEventListener('change',renderMessages);
+let discoverTimer,monitorTimer,messageTimer;
+window.addEventListener('pagehide',()=>{state.closed=true;state.events?.close();clearInterval(discoverTimer);clearInterval(monitorTimer);clearInterval(messageTimer);});
+try {
+  state.config=await request('/api/config');$('version').textContent='v'+state.config.version;
+  try{const saved=JSON.parse(localStorage.getItem('cooperation-tree-v1'));if(saved){state.openDirs=new Set(saved.dirs);state.openClients=new Set(saved.clients);state.knownDirs=new Set(saved.known);}}catch{}
+  newDirectories(state.config.directories||[]);connectEvents();await loadSessions(true);
+  discoverTimer=setInterval(()=>loadSessions(),15000);monitorTimer=setInterval(loadMonitoring,2500);messageTimer=setInterval(loadMessages,10000);
+}catch(error){notice('无法连接本地管理服务：'+error.message);$('connection-label').textContent='服务未连接';}
