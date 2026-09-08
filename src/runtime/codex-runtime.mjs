@@ -38,8 +38,14 @@ export function projectCodexState(s) {
   // neither the runtime snapshot nor its event log keeps that text.
   const history = s.turnHistory?.kind === 'canonical' ? s.turnHistory.history : null;
   const canonical = history?.islands?.flatMap(island => island.entries?.map(entry => history.entitiesByKey?.[entry.value]) || []).filter(Boolean) || [];
-  const turns = [...canonical, ...(Array.isArray(s.turns) ? s.turns : [])];
-  const active = turns.filter(t => t.status === 'inProgress' && t.turnId);
+  const legacy = Array.isArray(s.turns) ? s.turns : [];
+  const turns = [...canonical, ...legacy];
+  // Old canonical turns can retain inProgress after a native interruption.
+  // The chronological head determines current activity; a separate legacy
+  // turn is still considered until canonical history contains that turn ID.
+  const canonicalIds = new Set(canonical.map(t => t.turnId));
+  const currentTurns = canonical.length ? [canonical.at(-1), ...legacy.filter(t => !canonicalIds.has(t.turnId))] : legacy;
+  const active = currentTurns.filter(t => t.status === 'inProgress' && t.turnId);
   const activeIds = [...new Set(active.map(t => t.turnId))];
   const latest = canonical.at(-1) || turns.at(-1);
   const flags = s.threadRuntimeStatus?.activeFlags || [];
@@ -48,7 +54,8 @@ export function projectCodexState(s) {
   else if (flags.includes('waitingOnApproval')) activity = 'waiting_permission';
   else if (flags.includes('waitingOnUserInput')) activity = 'waiting_input';
   else if (s.threadRuntimeStatus?.type === 'active' && activeIds.length === 1) activity = 'running';
-  else if (s.threadRuntimeStatus?.type === 'idle' && activeIds.length === 0 && !s.requests?.length) activity = 'idle';
+  else if (s.threadRuntimeStatus?.type === 'idle' && activeIds.length === 0 && !s.requests?.length && !s.unconfirmedTurnSubmissions?.length
+    && (!latest || ['completed', 'interrupted', 'failed'].includes(latest.status))) activity = 'idle';
   const model = text(s.latestModel) || text(s.latestCollaborationMode?.settings?.model);
   const effort = s.latestThreadSettings?.effort !== undefined ? text(s.latestThreadSettings.effort)
     : s.latestCollaborationMode?.settings?.reasoning_effort !== undefined ? text(s.latestCollaborationMode.settings.reasoning_effort) : text(s.latestReasoningEffort);
@@ -57,6 +64,7 @@ export function projectCodexState(s) {
   if (implicitCwd?.sandboxPolicy?.type === 'workspaceWrite') implicitCwd.sandboxPolicy.writableRoots = implicitCwd.sandboxPolicy.writableRoots.filter(path => path !== normalizeDirectory(s.cwd));
   return { activity, activeTurnId: activeIds.length === 1 ? activeIds[0] : null,
     subagentHistoryPresent: turns.some(turn => turn.items?.some(item => item.type === 'collabAgentToolCall')),
+    historicalInProgressTurns: canonical.slice(0, -1).filter(t => t.status === 'inProgress').length,
     pendingRequests: s.requests?.length || 0, runtimeStatus: text(s.threadRuntimeStatus?.type),
     activeFlags: flags.filter(v => typeof v === 'string'), model, effort, lastOperationEffort: text(s.latestReasoningEffort),
     effortSource: s.latestThreadSettings?.effort !== undefined ? 'thread-settings' : s.latestCollaborationMode?.settings?.reasoning_effort !== undefined ? 'collaboration-settings' : 'latest-operation',

@@ -136,13 +136,15 @@ function topLevelMetadata(line) {
 async function transcriptMetadata(filename, expectedId, fallbackCwd) {
   const fileInfo = await stat(filename);
   const metadata = { id: expectedId, cwd: fallbackCwd ?? null, customTitle: null, aiTitle: null, transcriptPath: filename, updatedAt: iso(fileInfo.mtimeMs) };
+  let hasSessionCwd = false;
   const input = createReadStream(filename, { encoding: 'utf8' });
   const lines = createInterface({ input, crlfDelay: Infinity });
   try {
     for await (const line of lines) {
       const fields = topLevelMetadata(line);
       if (fields.sessionId && fields.sessionId.toLowerCase() !== expectedId.toLowerCase()) continue;
-      if (typeof fields.cwd === 'string' && fields.cwd) metadata.cwd = fields.cwd;
+      // Later cwd fields follow shell directory changes, not the session's project.
+      if (!hasSessionCwd && typeof fields.cwd === 'string' && fields.cwd) { metadata.cwd = fields.cwd; hasSessionCwd = true; }
       if (fields.type === 'custom-title' && typeof fields.customTitle === 'string') metadata.customTitle = fields.customTitle.trim() || null;
       if (fields.type === 'ai-title' && typeof fields.aiTitle === 'string') metadata.aiTitle = fields.aiTitle.trim() || null;
     }
@@ -151,6 +153,24 @@ async function transcriptMetadata(filename, expectedId, fallbackCwd) {
     input.destroy();
   }
   return metadata;
+}
+
+async function verifyRegistryLifetimes(records, warnings) {
+  if (process.platform !== 'win32') return;
+  const candidates = records.filter(record => record.live && (record.procStartFt || record.procStart));
+  if (!candidates.length) return;
+  const pids = [...new Set(candidates.map(record => record.pid))];
+  // Numeric PIDs were validated by alive(). Query metadata only, in one batch;
+  // old registry files may refer to PIDs now owned by unrelated processes.
+  const script = '$taskProcesses = @(Get-Process -Id ' + pids.join(',')
+    + ' -ErrorAction SilentlyContinue | ForEach-Object { try { [pscustomobject]@{pid=$_.Id; start=$_.StartTime.ToFileTimeUtc().ToString()} } catch {} }); ConvertTo-Json -Compress -InputObject $taskProcesses';
+  let starts = new Map();
+  try {
+    const { stdout } = await execFileAsync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 5000, maxBuffer: 256 * 1024 });
+    const values = JSON.parse(stdout.trim());
+    starts = new Map((Array.isArray(values) ? values : [values]).map(value => [value.pid, value.start]));
+  } catch { warnings.push('Could not verify Claude registry process lifetimes; unverified records are not treated as live.'); }
+  for (const record of candidates) record.live = starts.get(record.pid) === String(record.procStartFt || record.procStart);
 }
 
 async function liveRecords(root, { id, directory, recursive = false } = {}, warnings = []) {
@@ -169,6 +189,7 @@ async function liveRecords(root, { id, directory, recursive = false } = {}, warn
       if (error.code !== 'ENOENT' && id) warnings.push('One Claude live-session record could not be read.');
     }
   }
+  await verifyRegistryLifetimes(records, warnings);
   return records;
 }
 
@@ -180,7 +201,7 @@ function combine(metadata, records = []) {
   return {
     client: 'claude',
     id,
-    name: metadata?.customTitle || metadata?.aiTitle || record?.name || `Claude ${id.slice(0, 8)}`,
+    name: metadata?.customTitle || metadata?.aiTitle || (record?.nameSource !== 'derived' ? record?.name : null) || `Claude ${id.slice(0, 8)}`,
     cwd: record?.cwd || metadata?.cwd || null,
     status: live ? 'running' : 'offline',
     live,
@@ -227,7 +248,8 @@ export async function listClaudeSessions({ directory = process.cwd(), recursive 
     group.push(record);
     grouped.set(record.sessionId, group);
   }
-  const ids = new Set([...saved.keys(), ...grouped.keys()]);
+  const liveIds = [...grouped].filter(([, group]) => group.some(record => record.live)).map(([id]) => id);
+  const ids = new Set([...saved.keys(), ...liveIds]);
   const sessions = [...ids].map((id) => {
     const group = grouped.get(id) ?? [];
     if (group.filter((record) => record.live).length > 1) warnings.push(`Claude session ${id} is open in multiple processes; sending will require a single live target.`);
@@ -254,7 +276,7 @@ export async function findClaudeSession(id, { configDir } = {}) {
       if (error.code !== 'ENOENT') throw fault('CLAUDE_METADATA_UNAVAILABLE', 'Could not read the selected Claude session metadata.');
     }
   }
-  return metadata || records.length ? combine(metadata, records) : null;
+  return metadata || records.some(record => record.live) ? combine(metadata, records) : null;
 }
 
 function canonicalEndpoint(endpoint) {

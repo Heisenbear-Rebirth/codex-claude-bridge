@@ -97,3 +97,24 @@ test('independent peer preserves native turn settings and refuses stale precise 
   assert.equal(h.requests[0].sourceClientId, 'initializing-client');
   assert.equal(h.requests[1].sourceClientId, 'independent-observer');
 });
+
+
+test('old in-progress history does not block an idle head or hide the actual running turn', () => {
+  const source = state();
+  const history = source.turnHistory.history;
+  history.islands[0].entries.unshift({ value: 'old' });
+  history.entitiesByKey.old = { turnId: 'old-interrupted-turn', status: 'inProgress', items: [] };
+  let snapshot = projectCodexState(source);
+  assert.equal(snapshot.activity, 'idle'); assert.equal(snapshot.activeTurnId, null);
+  assert.equal(snapshot.historicalInProgressTurns, 1);
+  source.requests = [{ id: 'pending' }]; assert.equal(projectCodexState(source).activity, 'unknown'); source.requests = [];
+  source.unconfirmedTurnSubmissions = [{}]; assert.equal(projectCodexState(source).activity, 'unknown'); source.unconfirmedTurnSubmissions = [];
+  source.turns = [{ turnId: 'separate-live-turn', status: 'inProgress' }];
+  assert.equal(projectCodexState(source).activity, 'unknown'); source.turns = [];
+  history.entitiesByKey.one.status = 'inProgress';
+  assert.equal(projectCodexState(source).activity, 'unknown');
+  source.threadRuntimeStatus.type = 'active'; snapshot = projectCodexState(source);
+  assert.equal(snapshot.activity, 'running'); assert.equal(snapshot.activeTurnId, 'turn-one');
+  history.entitiesByKey.one.status = 'unexpected'; source.threadRuntimeStatus.type = 'idle';
+  assert.equal(projectCodexState(source).activity, 'unknown');
+});

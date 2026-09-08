@@ -133,3 +133,48 @@ test('Claude sender rejects invalid, offline and oversized targets before transp
   await registry(root, id, path.join(root, 'workspace'), { messagingSocketPath: 'https://example.invalid/inbox' });
   await assert.rejects(sendClaudeMessage({ targetId: id, text: 'hello', configDir: root }), { code: 'CLAUDE_INVALID_INBOX' });
 });
+
+
+test('shell cwd changes do not move a conversation out of its project or discard its title', async t => {
+  const root = await fixture(t), cwd = path.join(root, 'selected'), id = randomUUID();
+  await transcript(root, cwd, id, [
+    { type: 'user', sessionId: id, cwd, message: { content: 'private original prompt' } },
+    { type: 'custom-title', sessionId: id, customTitle: 'gs' },
+    { type: 'assistant', sessionId: id, cwd: path.join(cwd, 'research', 'src') },
+  ]);
+  await registry(root, id, cwd, { name: 'selected-a1', nameSource: 'derived' });
+  const result = await listClaudeSessions({ directory: cwd, configDir: root });
+  assert.equal(result.sessions.length, 1); assert.equal(result.sessions[0].name, 'gs');
+  assert.equal(result.sessions[0].cwd, cwd);
+  assert.equal((await findClaudeSession(id, { configDir: root })).cwd, cwd);
+  const child = await listClaudeSessions({ directory: path.join(cwd, 'research'), configDir: root });
+  assert.equal(child.sessions.length, 0);
+});
+
+test('expired registry-only entries are excluded while saved offline conversations remain visible', async t => {
+  const root = await fixture(t), cwd = path.join(root, 'selected'), oldId = randomUUID(), liveId = randomUUID();
+  const stale = { pid: 2147483647, sessionId: oldId, cwd, name: 'stale-process-name', startedAt: 1 };
+  await writeFile(path.join(root, 'sessions', '2147483647.json'), JSON.stringify(stale));
+  assert.equal((await listClaudeSessions({ directory: cwd, configDir: root })).sessions.length, 0);
+  assert.equal(await findClaudeSession(oldId, { configDir: root }), null);
+  await registry(root, liveId, cwd, { name: 'selected-a1', nameSource: 'derived' });
+  let result = await listClaudeSessions({ directory: cwd, configDir: root });
+  assert.equal(result.sessions.length, 1); assert.equal(result.sessions[0].id, liveId);
+  assert.equal(result.sessions[0].name, 'Claude ' + liveId.slice(0, 8));
+  await transcript(root, cwd, oldId, [{ type: 'user', sessionId: oldId, cwd }, { type: 'custom-title', sessionId: oldId, customTitle: 'Saved conversation' }]);
+  result = await listClaudeSessions({ directory: cwd, configDir: root });
+  assert.equal(result.sessions.length, 2);
+  const saved = result.sessions.find(s => s.id === oldId);
+  assert.equal(saved.name, 'Saved conversation'); assert.equal(saved.live, false);
+});
+
+test('a reused Windows PID cannot revive a stale Claude registry record', { skip: process.platform !== 'win32' }, async t => {
+  const root = await fixture(t), cwd = path.join(root, 'selected'), id = randomUUID();
+  await registry(root, id, cwd, { procStart: '1' });
+  assert.equal((await listClaudeSessions({ directory: cwd, configDir: root })).sessions.length, 0);
+  assert.equal(await findClaudeSession(id, { configDir: root }), null);
+  await transcript(root, cwd, id, [{ type: 'user', sessionId: id, cwd }, { type: 'ai-title', sessionId: id, aiTitle: 'Saved title' }]);
+  const result = await listClaudeSessions({ directory: cwd, configDir: root });
+  assert.equal(result.sessions.length, 1); assert.equal(result.sessions[0].live, false);
+  assert.equal(result.sessions[0].name, 'Saved title');
+});
