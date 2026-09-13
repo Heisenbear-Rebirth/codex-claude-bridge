@@ -6,6 +6,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonLineObserver, ClaudeProtocolState } from './claude-wrapper-state.mjs';
 import { NativeContextChannel } from './claude-context-channel.mjs';
+import { PeerMessageVisibility } from './claude-peer-visibility.mjs';
+import { loadPeerHistory } from './claude-peer-history.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const normalize = value => resolve(value).replace(/^\\\\\?\\/, '').replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase();
@@ -14,8 +16,14 @@ if (!normalize(dataDirectory).startsWith(normalize(root) + '/')) throw new Error
 const [binary, ...args] = process.argv.slice(2);
 if (!binary) { process.stderr.write('[Cooperation] Missing original Claude executable.\n'); process.exit(1); }
 let enabled = false;
+let peerMessageVisibility = process.env.COOP_PEER_MESSAGE_VISIBILITY !== '0';
+// Reopening must not append old messages as if they were new arrivals.
+let peerHistoryVisibility = process.env.COOP_PEER_HISTORY_VISIBILITY === '1';
 try {
   const config = JSON.parse(await readFile(join(dataDirectory, 'config.json'), 'utf8'));
+  peerMessageVisibility &&= config.peerMessageVisibility !== false;
+  peerHistoryVisibility = process.env.COOP_PEER_HISTORY_VISIBILITY !== '0'
+    && (peerHistoryVisibility || config.peerHistoryVisibility === true);
   enabled = config.enabled === true && Array.isArray(config.directories) && config.directories.some(directory => normalize(directory) === normalize(process.cwd()))
     && args.includes('stream-json') && args.includes('--input-format');
 } catch { /* No project configuration means pure passthrough. */ }
@@ -30,12 +38,15 @@ let server, endpoint, pending, closing = false, writing = Promise.resolve(), las
 let controlPending = null, lastControl = null;
 const controlOperations = new Map();
 let registryTimer;
+let visibilityHistory = { status: enabled && peerMessageVisibility && peerHistoryVisibility ? 'pending' : 'disabled', count: 0 };
+let historyRestoreSession = null;
 const auditFile = join(dataDirectory, 'compactions.jsonl');
 const audit = event => appendFile(auditFile, JSON.stringify({ at: new Date().toISOString(), instanceId, ...event }) + '\n', 'utf8');
 function publicState() { return { ...state.publicState(), wrapperPid: process.pid, childPid: child.pid, instanceId, cwd: process.cwd(),
   protocolVersion: 2, connected: !closing && !state.inputEnded, observedAt: new Date().toISOString(),
   capabilities: { readActivity: true, interrupt: true, sendControl: true, compact: true, observeCompletion: true, passiveUsage: true,
-    hardAutomation: false },
+    hardAutomation: false, peerMessageVisibility: enabled && peerMessageVisibility, peerHistoryVisibility: enabled && peerMessageVisibility && peerHistoryVisibility },
+  visibilityHistory,
   canCompact: Boolean(!pending && !controlPending && !contextChannel.active && state.canCompact(inputObserver.atBoundary)),
   compactionRequestId: pending?.id || null, lastCompaction, controlPending, lastControl }; }
 function persist() {
@@ -92,9 +103,30 @@ child.stdin.on('drain', () => process.stdin.resume());
 process.stdin.on('end', () => { state.inputEnded = true; child.stdin.end(); persist(); });
 process.stdin.on('error', () => child.stdin.end());
 child.stdin.on('error', () => { state.inputEnded = true; persist(); });
-function forwardOutput(chunk) { if (!process.stdout.write(chunk)) child.stdout.pause(); if (enabled) outputObserver.push(chunk); }
+const peerVisibility = new PeerMessageVisibility(() => state.sessionId);
+function writeIdeOutput(chunk) { if (!process.stdout.write(chunk)) child.stdout.pause(); }
+function forwardOutput(chunk) {
+  // Activity and maintenance observe original native messages, not display copies.
+  if (enabled) outputObserver.push(chunk);
+  if (enabled && peerMessageVisibility) peerVisibility.push(chunk, writeIdeOutput);
+  else writeIdeOutput(chunk);
+  if (enabled && peerMessageVisibility && peerHistoryVisibility && state.initialized && state.sessionId && !historyRestoreSession) {
+    historyRestoreSession = state.sessionId;
+    const restoreEpoch = state.contextEpoch;
+    void loadPeerHistory({ sessionId: historyRestoreSession, cwd: process.cwd() }).then(result => {
+      if (closing || state.sessionId !== historyRestoreSession) return;
+      if (pending || state.contextEpoch !== restoreEpoch) {
+        visibilityHistory = { status: 'unavailable', count: 0, reason: 'context_changed_during_restore' }; persist(); return;
+      }
+      peerVisibility.restoreHistory(result.frames, writeIdeOutput);
+      visibilityHistory = { status: result.status, count: result.frames.length, truncated: result.truncated || false,
+        ...(result.reason ? { reason: result.reason } : {}) };
+      persist();
+    }).catch(() => { visibilityHistory = { status: 'unavailable', count: 0, reason: 'history_read_failed' }; persist(); });
+  }
+}
 child.stdout.on('data', chunk => { if (enabled) contextChannel.push(chunk, forwardOutput); else forwardOutput(chunk); });
-child.stdout.on('end', () => contextChannel.end(forwardOutput));
+child.stdout.on('end', () => { contextChannel.end(forwardOutput); peerVisibility.end(writeIdeOutput); });
 process.stdout.on('drain', () => child.stdout.resume());
 process.stdout.on('error', () => child.kill());
 child.stderr.pipe(process.stderr);

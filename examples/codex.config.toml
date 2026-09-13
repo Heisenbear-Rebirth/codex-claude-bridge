@@ -2,3 +2,4 @@
 command = "node"
 args = ["E:/Projects/Cooperation/bin/coop.mjs", "mcp", "--client", "codex"]
 tool_timeout_sec = 75
+env_vars = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_THREAD_ID", "CODEX_MCP_NODE_PATH"]

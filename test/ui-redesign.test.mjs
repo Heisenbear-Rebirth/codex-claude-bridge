@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { visibleAddresses, messageMatches, autoCompressEnabled, validThresholds, PolicySaver } from '../public/ui-state.mjs';
+import { visibleAddresses, messageMatches, autoCompressEnabled, validThresholds, PolicySaver, directoryConnection, connectionGuidance, sessionConnected } from '../public/ui-state.mjs';
 import { ContextMonitor } from '../src/context-monitor.mjs';
 import { ManagementStore } from '../src/management-store.mjs';
 import { CooperationService } from '../src/service.mjs';
@@ -78,4 +78,69 @@ test('HTTP autosave maps one checkbox, rejects stale edits and filters messages 
   const messages=async addresses=>(await(await fetch(server.url+'/api/messages?'+new URLSearchParams({addresses:JSON.stringify(addresses)}))).json()).messages;
   assert.deepEqual((await messages(['claude:'+idA])).map(m=>m.id).sort(),['incoming','outgoing']);
   assert.equal((await messages([])).length,0);
+});
+
+
+test('Claude connection is per directory and permission alone is not a live connection', () => {
+  const directory = { id: 'a', path: 'E:/Work/A', claudeControlEnabled: true };
+  const session = { client: 'claude', id: idA, cwd: directory.path, directoryIds: ['a'], monitoring: { runtime: { connected: false } } };
+  assert.equal(directoryConnection({ client: 'claude', directory, sessions: [session] }).reason, 'claude_session');
+  session.monitoring.runtime.connected = true;
+  let status = directoryConnection({ client: 'claude', directory, sessions: [session, session] });
+  assert.equal(status.connected, 1); assert.equal(status.total, 1);
+  const other = { ...directory, id: 'b', path: 'E:/Work/B' };
+  assert.equal(directoryConnection({ client: 'claude', directory: other, sessions: [session] }).connected, 0);
+  directory.claudeControlEnabled = false;
+  assert.equal(directoryConnection({ client: 'claude', directory, sessions: [session] }).reason, 'claude_access');
+});
+test('recursive directory status uses the actual child control permission and excludes stale snapshots', () => {
+  const directory = { id: 'a', path: 'E:/Work', recursive: true, claudeControlEnabled: false };
+  const session = { client: 'claude', id: idA, cwd: 'E:/Work/Child', directoryIds: ['a'], controlAccess: { directoryEnabled: true }, monitoring: { observedAt: '2026-09-09T00:00:00Z', runtime: { connected: true } } };
+  assert.equal(directoryConnection({ client: 'claude', directory, sessions: [session], now: Date.parse('2026-09-09T00:00:20Z') }).connected, 1);
+  assert.equal(directoryConnection({ client: 'claude', directory, sessions: [session], now: Date.parse('2026-09-09T00:02:00Z') }).reason, 'checking');
+});
+test('Codex directory readiness distinguishes a missing message bridge from an unopened task', () => {
+  const directory = { id: 'a', path: 'E:/Work' };
+  const session = { client: 'codex', id: idA, directoryIds: ['a'], monitoring: { runtime: { connected: true } } };
+  assert.equal(directoryConnection({ client: 'codex', directory, sessions: [session], bridge: { connected: false } }).reason, 'codex_bridge');
+  assert.equal(directoryConnection({ client: 'codex', directory, sessions: [session], bridge: { connected: true } }).connected, 1);
+  session.monitoring.runtime.connected = false;
+  assert.equal(directoryConnection({ client: 'codex', directory, sessions: [session], bridge: { connected: true } }).reason, 'codex_session');
+  assert.equal(directoryConnection({ client: 'codex', bridge: { connected: true } }).label, '已连接');
+  assert.equal(directoryConnection({ client: 'codex', directory, sessions: [session], bridge: { connected: true }, online: false }).reason, 'service_offline');
+});
+test('connection help provides scoped manual setup and preserves a running Claude task', () => {
+  const directory = { id: 'a', path: 'E:/Work/A', recursive: true };
+  const install = "E:/Tools/O'Brien Cooperation";
+  const guide = connectionGuidance({ client: 'claude', directory, status: { reason: 'claude_access', connected: 0 }, installationDirectory: install });
+  assert.equal(guide.scope, directory.path);
+  assert.ok(guide.steps.some(step => step.code?.includes("O''Brien")));
+  assert.ok(guide.steps.some(step => step.text.includes('等当前任务结束后')));
+  assert.ok(guide.note.includes('不会从父目录自动继承'));
+  const codex = connectionGuidance({ client: 'codex', directory, status: { reason: 'codex_bridge', connected: 0 }, installationDirectory: install });
+  const code = codex.steps.find(step => step.code).code;
+  assert.ok(code.includes('[mcp_servers.cooperation]'));
+  assert.ok(code.includes('CODEX_APP_TOOLS_PIPE_PATH'));
+  const args = JSON.parse(code.split('\n').find(line => line.startsWith('args = ')).slice(7));
+  assert.deepEqual(args, [install + '/bin/coop.mjs', 'mcp', '--client', 'codex']);
+  const ready = connectionGuidance({ client: 'codex', directory, status: { reason: 'codex_session', connected: 0 }, installationDirectory: install });
+  assert.equal(ready.steps.some(step => step.code), false);
+});
+
+
+test('connected-only filter shares connection badges, keeps busy sessions and filters communication scope',()=>{
+  const now=Date.now(),directory={id:'d',path:'E:/work',claudeControlEnabled:true};
+  const live={client:'claude',id:idA,name:'busy',cwd:directory.path,directoryIds:['d'],monitoring:{observedAt:new Date(now).toISOString(),runtime:{connected:true,controlsEnabled:true,activity:'running'}}};
+  const offline={...live,id:idB,name:'offline',monitoring:{runtime:{connected:false}}};
+  const options={onlyConnected:true,bridge:{connected:true},online:true,now};
+  assert.equal(sessionConnected(live,{...options,directory}),true);
+  assert.equal(sessionConnected({...live,monitoring:{...live.monitoring,observedAt:new Date(now-61000).toISOString()}},{...options,directory}),false);
+  assert.equal(sessionConnected(live,{...options,directory,online:false}),false);
+  assert.equal(sessionConnected({...live,client:'codex'},{...options,directory,bridge:{connected:false}}),false);
+  const dirs=[directory],open=new Set(['d']),groups=new Set(['d:claude']);
+  const visible=visibleAddresses(dirs,[live,offline],open,groups,'',options);
+  assert.deepEqual([...visible],['claude:'+idA]);
+  assert.equal(messageMatches({from:offline,to:offline},visible),false);
+  assert.equal(visibleAddresses(dirs,[live,offline],open,groups).size,2);
+  assert.equal(visibleAddresses(dirs,[live,offline],open,groups,'offline',options).size,0);
 });

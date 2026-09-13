@@ -1,3 +1,4 @@
+import { rememberCodexEnvironment } from './codex-bridge-connection.mjs';
 import { createInterface } from 'node:readline';
 import { detectSender } from './identity.mjs';
 import { sendViaManager, checkpointViaManager } from './client.mjs';
@@ -12,6 +13,7 @@ export function startMcp({ root, client } = {}) {
     try { request = JSON.parse(line); } catch { respond(null, null, { code: -32700, message: 'Invalid JSON' }); return; }
     if (!Object.hasOwn(request, 'id')) return;
     try {
+      if (request.method === 'initialize' && client === 'codex') await rememberCodexEnvironment(root);
       if (request.method === 'initialize') return respond(request.id, { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'cooperation', version: '0.2.0' }, instructions: '向用户指定的 Codex 或 Claude Code 会话发送正文，或在指定维护流程中回传阶段回执。工具自动取得当前发送方身份。' });
       if (request.method === 'ping') return respond(request.id, {});
       if (request.method === 'tools/list') return respond(request.id, { tools: [{ name: 'send_message', description: '向指定的现有原生会话发送一条消息。只发送给定正文，自动附带发送方身份；返回投递结果。', inputSchema: { type: 'object', properties: { to: { type: 'string', description: '接收方地址：codex:ID、claude:ID、客户端://会话名称:ID，或 Codex 原生深度链接。' }, message: { type: 'string', description: '要发送的完整消息正文。' } }, required: ['to', 'message'], additionalProperties: false } }, checkpointTool] });

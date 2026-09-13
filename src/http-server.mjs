@@ -1,3 +1,4 @@
+import { CodexBridgeConnection } from './codex-bridge-connection.mjs';
 import { createServer } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile, mkdir, writeFile, unlink } from 'node:fs/promises';
@@ -13,7 +14,7 @@ import { CheckpointService } from './checkpoint-service.mjs';
 import { readWrapperDirectories, wrapperEnabledFor, WrapperDirectorySettings } from './wrapper-directories.mjs';
 import { containsDirectory } from './directory-service.mjs';
 
-export async function startServer({ root, port = 47821, host = '127.0.0.1', defaultDirectory = root, codexContext, adapters, runtimeFactory, startMonitoring = true, onShutdown = () => {} } = {}) {
+export async function startServer({ root, port = 47821, host = '127.0.0.1', defaultDirectory = root, codexContext, adapters, bridgeProbe, runtimeFactory, startMonitoring = true, onShutdown = () => {} } = {}) {
   if (host !== '127.0.0.1') throw new Error('管理台仅允许监听 127.0.0.1。');
   const dataDirectory = join(root, '.cooperation');
   await mkdir(dataDirectory, { recursive: true });
@@ -36,7 +37,9 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
   const csrfToken = randomBytes(24).toString('hex');
   const streams = new Set();
   const publish = (event, data) => { for (const response of streams) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
-  const service = new CooperationService({ store, codexContext, adapters, onMessage: (id) => {
+  const codexBridge = !adapters ? await new CodexBridgeConnection({ root, context: codexContext, probe: bridgeProbe, onUpdate: state => publish('bridge', state) }).init() : null;
+  const bridgeStatus = () => codexBridge?.status() || { connected: Boolean(codexContext?.pipePath && codexContext?.callerThreadId), state: 'unmanaged' };
+  const service = new CooperationService({ store, codexContext, codexBridge, adapters, onMessage: (id) => {
     for (const response of streams) response.write(`event: message\ndata: ${JSON.stringify({ id })}\n\n`);
   } });
   const monitor = new ContextMonitor({ store, service, runtimeFactory, onUpdate: session => publish('management', { client: session.client, id: session.id }) });
@@ -67,7 +70,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
     try {
       if (url.pathname === '/api/service/status' || url.pathname === '/api/service/stop') {
         if (!equal(request.headers.authorization, `Bearer ${token}`)) return json(response, 401, { error: '需要本项目的管理服务凭据。' });
-        if (request.method === 'GET' && url.pathname === '/api/service/status') return json(response, 200, { service: 'cooperation', root, pid: process.pid, startedAt: connection.startedAt, closing: closed });
+        if (request.method === 'GET' && url.pathname === '/api/service/status') return json(response, 200, { service: 'cooperation', root, pid: process.pid, startedAt: connection.startedAt, closing: closed, codexBridge: bridgeStatus() });
         if (request.method === 'POST' && url.pathname === '/api/service/stop') {
           const expected = await body(request);
           if (expected.pid !== process.pid || expected.startedAt !== connection.startedAt) return json(response, 409, { error: '管理服务实例已改变，请重新运行关闭脚本。' });
@@ -78,8 +81,12 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
         return json(response, 405, { error: 'Method not allowed' });
       }
       if (request.method === 'GET' && url.pathname === '/api/config') {
-        return json(response, 200, { version: '0.2.0', defaultDirectory, directories: await directoryRecords(), policyDefaults: POLICY_DEFAULTS, csrfToken,
-          bridge: { codex: Boolean(codexContext?.pipePath && codexContext?.callerThreadId) }, warnings: store.warnings });
+        return json(response, 200, { version: '0.2.0', installationDirectory: root, defaultDirectory, directories: await directoryRecords(), policyDefaults: POLICY_DEFAULTS, csrfToken,
+          bridge: { codex: bridgeStatus().connected, codexStatus: bridgeStatus() }, warnings: store.warnings });
+      }
+      if (request.method === 'GET' && url.pathname === '/api/bridge') {
+        if (url.searchParams.get('refresh') === '1') await codexBridge?.refresh();
+        return json(response, 200, bridgeStatus());
       }
       if (request.method === 'POST' && url.pathname === '/api/sessions') {
         if (!equal(request.headers['x-coop-ui'], csrfToken)) return json(response, 403, { error: '请从本地管理页面查询会话。' });
@@ -183,7 +190,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
     } catch (error) { json(response, error.statusCode || 400, { error: error.message }); }
   });
   try { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); }); }
-  catch (error) { await controller.close(); await service.mailbox.close(); store.close(); throw error; }
+  catch (error) { await controller.close(); await service.mailbox.close(); await codexBridge?.close(); store.close(); throw error; }
   actualPort = server.address().port;
   const connection = { url: `http://${host}:${actualPort}`, token, pid: process.pid, startedAt: new Date().toISOString() };
   const connectionFile = join(dataDirectory, 'connection.json');
@@ -192,7 +199,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
   async function close() {
     if (closed) return closingPromise; closed = true;
     closingPromise = (async () => {
-    await controller.close(); await service.mailbox.close();
+    await controller.close(); await service.mailbox.close(); await codexBridge?.close();
     for (const response of streams) response.end();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
@@ -201,7 +208,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
     })();
     return closingPromise;
   }
-  return { server, url: connection.url, close, service, store, monitor, controller, checkpoints };
+  return { server, url: connection.url, close, service, store, monitor, controller, checkpoints, codexBridge };
 }
 function equal(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;

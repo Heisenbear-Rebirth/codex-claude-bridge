@@ -64,3 +64,20 @@ Claude 可能要求用户批准该命令。可采用项目范围的窄 allow 规
 先关闭使用 wrapper 的面板，在 VS Code 中恢复原 `claudeCode.claudeProcessWrapper` 值，再重新打开会话。不要覆盖其他设置。
 
 `scripts/vscode-wrapper-settings.mjs` 提供带备份及哈希检查的 prepare/apply/restore 辅助命令；它会访问 VS Code 用户设置，只有用户明确授权后才应使用。未调用这些命令时，构建和启动本项目不会自动改写用户设置。
+
+
+## 统一的可见消息发送
+
+Cooperation 的 CLI、MCP 和管理页普通消息共同进入 `ClaudeRuntime.sendMessage`。普通消息使用 peer 通道，空闲与忙碌均可投递，保持原有发送方与接收策略；不会自动调用 interrupt。交付、恢复、继续提示也从该入口分派，但保持维护控制轮次和空闲状态校验。原生回显经 wrapper 显示，同一消息 UUID 不重复投递。
+
+强停压缩的顺序仍是 interrupt → 确认原轮次结束 → 可见交付提示 → handoff 回执且轮次结束 → 原生 compact → 可见恢复提示 → restored 回执且轮次结束 → 按原状态决定是否继续并释放 FIFO。收到 interrupt 的确认本身不等于原轮次已结束。
+
+`peerMessageVisibility` 能力只说明已启用实时显示转换；`peerHistoryVisibility` 说明已显式启用重开后恢复，默认 false。投递结果中的 `visibility.displayConfirmed` 不因传输提交而置为 true。旧 wrapper 可以继续收普通 peer 消息，但结果会说明其显示能力尚未启用，需在工作结束后正常重开。
+
+默认不执行历史补显，也不为补显读取原生 JSONL；`visibilityHistory` 报告 `disabled`、count 为 0。新消息仍按原生回显实时显示。重开后旧协作消息可能不再出现在 Claude 面板中，可在 Cooperation 管理页查看通信历史。这样避免将多条旧消息集中补到对话末尾，让人误以为它们再次发来。
+
+如明确需要恢复旧行为，可在项目 wrapper 配置中设置 `peerHistoryVisibility: true`，或在启动环境中设置 `COOP_PEER_HISTORY_VISIBILITY=1`；`COOP_PEER_HISTORY_VISIBILITY=0` 优先关闭。仅显式开启时读取本会话 JSONL，沿当前分支选取最近 200 条 Cooperation peer，在完整行边界向 IDE 补回；不会写原生历史或进入模型输入。恢复消息仍位于末尾，不保证原先的交错位置。未知历史位置、读取失败或同时压缩会跳过恢复并报告原因。
+
+实时回放与历史补显共用按会话 ID 和消息 UUID 去重的记录，两种到达顺序都只输出一次，不依赖面板再次去重。配置及代码变更在 wrapper 下次正常启动时生效，不热更新或重启正在工作的客户端。
+
+关闭 `COOP_PEER_MESSAGE_VISIBILITY=0` 或项目 wrapper 配置 `peerMessageVisibility: false` 会同时关闭实时转换与历史恢复，在下次启动时生效。原生启动参数、权限和模型设置仍原样传递。

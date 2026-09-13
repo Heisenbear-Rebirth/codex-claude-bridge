@@ -15,7 +15,7 @@ try {
     const instance = await startServer({ root, port: Number(option('--port') || 0), defaultDirectory: resolve(option('--directory') || process.cwd()), codexContext, onShutdown: () => process.exit(0) });
     console.log(`Cooperation 管理台：${instance.url}`);
     console.log(`数据保存于：${resolve(root, '.cooperation')}`);
-    if (!codexContext.pipePath || !codexContext.callerThreadId) console.log('未连接 Codex App 发送桥；会话元数据与消息记录仍可查看。');
+    if (!instance.codexBridge?.status().connected) console.log('正在等待 Codex 接入；配置 Cooperation MCP 后，打开 Codex 可自动连接。');
     const stop = () => instance.close().finally(() => process.exit(0));
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
   } else if (command === 'mcp') startMcp({ root, client: option('--client') });

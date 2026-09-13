@@ -254,6 +254,25 @@ function startBridge({ nodePath, bridgePath, pipePath, handshakeTimeoutMs, reque
   };
 }
 
+/** Read-only readiness check; never calls a message tool. */
+export async function probeCodexBridge(context = {}) {
+  const pipePath = context.pipePath ?? process.env.CODEX_APP_TOOLS_PIPE_PATH;
+  const callerThreadId = context.callerThreadId ?? process.env.CODEX_THREAD_ID;
+  if (!pipePath || !callerThreadId) throw adapterError('CODEX_CONTEXT_MISSING', 'Codex 尚未连接。');
+  const bridgePath = context.bridgePath ?? await discoverBridge(context.codexHome);
+  if (!bridgePath) throw adapterError('CODEX_BRIDGE_MISSING', 'Codex App 的连接组件尚未就绪。');
+  const bridge = startBridge({ nodePath: context.nodePath ?? process.env.CODEX_MCP_NODE_PATH ?? process.execPath,
+    bridgePath, pipePath, handshakeTimeoutMs: context.handshakeTimeoutMs ?? 3000 });
+  try {
+    await bridge.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'cooperation', version: '0.2.0' } });
+    bridge.notify('notifications/initialized');
+    const catalog = await bridge.request('tools/list', {});
+    if (!catalog.tools?.some(tool => tool.name === 'send_message_to_thread' || tool.name?.endsWith('__send_message_to_thread')))
+      throw adapterError('CODEX_SEND_UNAVAILABLE', 'Codex 暂未提供会话消息工具。');
+    return { connected: true };
+  } finally { await bridge.close(); }
+}
+
 /** Send once through the App bridge using the real originating Codex context. */
 export async function sendCodexMessage({ targetId, text, context = {} } = {}) {
   if (typeof targetId !== 'string' || !targetId.trim() || typeof text !== 'string' || !text.trim()) {

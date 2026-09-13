@@ -62,7 +62,8 @@ export class ManagementStore {
       this.finishOutbox(row.id, { status: 'unknown', error: '上次服务退出前未确认发送结果，请核对原会话。' });
     }
     for (const cycle of this.activeCycles()) {
-      this.updateCycle(cycle.id, 'needs_attention', { previousState: ['needs_attention', 'user_intervened'].includes(cycle.state) ? cycle.previousState : cycle.state, reason: '服务重启，需核对上一次外部操作及原生轮次后继续。' });
+      if (cycle.state === 'user_intervened' || cycle.recoveryBlocked || cycle.state === 'waiting_client') continue;
+      this.updateCycle(cycle.id, 'needs_attention', { previousState: ['needs_attention', 'user_intervened', 'waiting_client'].includes(cycle.state) ? cycle.previousState : cycle.state, reason: '服务重启，需核对上一次外部操作及原生轮次后继续。' });
     }
   }
   close() {

@@ -3,6 +3,7 @@ import { readFile, mkdir, open } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { rememberCodexEnvironment } from '../src/codex-bridge-connection.mjs';
 
 const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
 const data = join(root, '.cooperation');
@@ -35,6 +36,7 @@ function openPage(url) {
   child.on('error', () => console.error('Could not open the browser. Open the printed URL manually.')); child.unref();
 }
 async function start() {
+  await rememberCodexEnvironment(root);
   const saved = await connection(), current = await status(saved);
   if (current) {
     if (current.closing) throw new Error('The manager is still stopping. Try again shortly.');

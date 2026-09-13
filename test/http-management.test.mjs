@@ -11,6 +11,7 @@ test('management HTTP persists multiple roots and policies, limits mutations to 
     runtimeFactory: () => ({ status: async () => ({ connected: true, activity: 'idle', model: 'fixture', capabilities: {} }), close() {} }) });
   t.after(async () => { await server.close(); assert.ok(root.startsWith(resolve('.') + '\\') || root.startsWith(resolve('.') + '/')); await rm(root, { recursive: true, force: true }); });
   const config = await (await fetch(server.url + '/api/config')).json();
+  assert.equal(config.installationDirectory, root);
   const post = (path, body, token = config.csrfToken) => fetch(server.url + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Coop-UI': token }, body: JSON.stringify(body) });
   assert.equal((await post('/api/directories', { path: child }, 'wrong')).status, 403);
   const directories = await (await post('/api/directories', { path: child })).json(); assert.equal(directories.directories.length, 2);

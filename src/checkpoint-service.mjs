@@ -19,7 +19,7 @@ export class CheckpointService {
       return { status: 'accepted', cycleId, stage, duplicate: true };
     }
     const expected = stage === 'handoff' ? 'writing_handoff' : 'restoring';
-    if (cycle.state !== expected || !cycle.controlDispatched) throw new Error('该维护流程目前不接受此阶段的回执。');
+    if ((cycle.state === 'waiting_client' ? cycle.previousState : cycle.state) !== expected || !cycle.controlDispatched) throw new Error('该维护流程目前不接受此阶段的回执。');
     if (typeof documentPath !== 'string' || !isAbsolute(documentPath)) throw new Error('请提供交付文档的绝对路径。');
     const allowedRoot = await realpath(cycle.session.cwd);
     const actual = await realpath(documentPath);
@@ -40,7 +40,7 @@ export class CheckpointService {
       const current = this.store.cycle(cycleId);
       const duplicate = this.store.checkpoint(cycleId, stage);
       if (duplicate && duplicate.documentHash === documentHash) return;
-      if (current.revision !== cycle.revision || current.state !== expected) throw new Error('维护流程在校验期间已改变，请核对后重试回执。');
+      if (current.revision !== cycle.revision || (current.state === 'waiting_client' ? current.previousState : current.state) !== expected) throw new Error('维护流程在校验期间已改变，请核对后重试回执。');
       this.store.saveCheckpoint(cycleId, stage, receipt);
       this.store.updateCycle(cycleId, stage === 'handoff' ? 'awaiting_handoff_end' : 'awaiting_restore_end',
         { ...(stage === 'handoff' ? { documentHash, handoffPath: actual } : {}), receiptAt: receipt.at });

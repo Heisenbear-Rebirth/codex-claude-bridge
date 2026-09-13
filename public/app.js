@@ -1,10 +1,10 @@
-import { addressOf, autoCompressEnabled, visibleAddresses, messageMatches, validThresholds, PolicySaver } from './ui-state.mjs';
+import { addressOf, autoCompressEnabled, visibleAddresses, messageMatches, validThresholds, PolicySaver, directoryConnection, connectionGuidance, sessionConnected } from './ui-state.mjs';
 const $ = id => document.getElementById(id);
-const state = { config: null, directories: [], sessions: [], messages: [], openDirs: new Set(), openClients: new Set(), knownDirs: new Set(),
-  editors: new Map(), cards: new Map(), selected: null, messageRequest: 0, sessionRequest: 0, discoveryBusy: false, events: null, closed: false, signature: '', scope: '', messageTimer: null };
+const state = { config: null, bridgeStatus:null, serviceOnline:true, connectionButtons:new Map(), connectionHelp:null, directories: [], sessions: [], messages: [], openDirs: new Set(), openClients: new Set(), knownDirs: new Set(),
+  editors: new Map(), cards: new Map(), selected: null, messageRequest: 0, sessionRequest: 0, discoveryBusy: false, events: null, closed: false, signature: '', connectedSignature: '', scope: '', messageTimer: null };
 const activities = { idle: '空闲', running: '工作中', waiting_permission: '等待权限', waiting_input: '等待答复', initializing: '初始化中', unloaded: '未加载', offline: '离线', unknown: '待确认' };
 const delivery = { submitted: '已提交', queued: '已排队', pending: '提交中', unknown: '待确认', failed: '发送失败', held: '已保留' };
-const phases = { interrupting: '正在暂停任务', writing_handoff: '保存交付文档', awaiting_handoff_end: '等待交付轮次结束', compacting: '正在压缩', restoring: '加载上文', awaiting_restore_end: '等待恢复轮次结束', needs_attention: '需要处理', user_intervened: '用户已介入', completed: '维护已完成', cancelled: '维护已取消' };
+const phases = { waiting_client: '等待客户端重连', interrupting: '正在暂停任务', writing_handoff: '保存交付文档', awaiting_handoff_end: '等待交付轮次结束', compacting: '正在压缩', restoring: '加载上文', awaiting_restore_end: '等待恢复轮次结束', needs_attention: '需要处理', user_intervened: '用户已介入', completed: '维护已完成', cancelled: '维护已取消' };
 function el(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = text; return node; }
 function button(text, className, action) { const node = el('button', className, text); node.type = 'button'; node.addEventListener('click', action); return node; }
 function notice(text) { $('global-error').textContent = text || ''; $('global-error').hidden = !text; }
@@ -107,6 +107,7 @@ function buildCard(session) {
   return card;
 }
 function refreshCards() {
+  if(refreshConnectedFilter())return;
   let automatic=0;
   for(const session of state.sessions) {
     const key=addressOf(session), value=editor(session), sample=session.monitoring, runtime=sample?.runtime, usage=sample?.usage;
@@ -152,10 +153,53 @@ function refreshCards() {
       }
     }
   }
-  $('auto-count').textContent=automatic;$('total-sessions').textContent=state.sessions.length;
+  $('auto-count').textContent=automatic;$('total-sessions').textContent=state.sessions.length;refreshConnections();
+}
+function connectionState(client, directory = null) {
+  return directoryConnection({client,directory,sessions:state.sessions,bridge:state.bridgeStatus,online:state.serviceOnline});
+}
+function refreshConnections() {
+  for(const [key,entry] of state.connectionButtons) {
+    const directory=state.directories.find(d=>d.id===entry.directoryId);if(!directory)continue;
+    const status=connectionState(entry.client,directory);
+    entry.button.textContent=status.label;entry.button.className='client-connection '+status.tone;
+    entry.button.title='此目录全部 '+(entry.client==='claude'?'Claude':'Codex')+' 会话的连接状态，点击查看接入方法';
+    entry.button.setAttribute('aria-label',directory.path+' 的 '+entry.client+'：'+status.label+'，查看连接方法');
+  }
+  if(state.connectionHelp)renderConnectionHelp();
+}
+function renderConnectionHelp() {
+  const context=state.connectionHelp;if(!context)return;
+  const directory=context.directoryId?state.directories.find(d=>d.id===context.directoryId):null;
+  if(context.directoryId&&!directory){$('connection-dialog').close();state.connectionHelp=null;return;}
+  const status=connectionState(context.client,directory);
+  const signature=JSON.stringify([context.client,directory,status,state.config?.installationDirectory]);
+  if(context.signature===signature)return;context.signature=signature;
+  const guide=connectionGuidance({client:context.client,directory,status,installationDirectory:state.config?.installationDirectory||''});
+  $('connection-help-title').textContent=guide.title;$('connection-help-scope').textContent=guide.scope;
+  $('connection-help-summary').textContent=guide.summary;$('connection-help-steps').replaceChildren();
+  for(const step of guide.steps) {
+    const item=el('li'),content=el('div','connection-step');content.append(el('h3','',step.title),el('p','',step.text));
+    if(step.code)content.append(el('pre','connection-code',step.code),button(step.copyLabel||'复制','text-button',()=>copy(step.code)));
+    item.append(content);$('connection-help-steps').append(item);
+  }
+  $('connection-help-note').textContent=guide.note||'';$('connection-help-note').hidden=!guide.note;
+}
+function showConnectionHelp(client,directoryId=null) {
+  state.connectionHelp={client,directoryId,signature:null};renderConnectionHelp();
+  if(!$('connection-dialog').open)$('connection-dialog').showModal();
 }
 function rememberTree() { try { localStorage.setItem('cooperation-tree-v1',JSON.stringify({dirs:[...state.openDirs],clients:[...state.openClients],known:[...state.knownDirs]})); } catch {} }
-function visible() { return visibleAddresses(state.directories,state.sessions,state.openDirs,state.openClients,$('session-search').value); }
+function connectionFilter(directory) { return {directory,onlyConnected:$('connected-only').checked,bridge:state.bridgeStatus,online:state.serviceOnline}; }
+function matchesConnection(session,directory) { return !$('connected-only').checked||sessionConnected(session,connectionFilter(directory)); }
+function connectedSignature() {
+  return $('connected-only').checked?JSON.stringify(state.directories.map(d=>[d.id,state.sessions.filter(s=>s.directoryIds?.includes(d.id)&&matchesConnection(s,d)).map(addressOf).sort()])):'';
+}
+function refreshConnectedFilter() {
+  if(connectedSignature()===state.connectedSignature)return false;
+  renderTree();return true;
+}
+function visible() { return visibleAddresses(state.directories,state.sessions,state.openDirs,state.openClients,$('session-search').value,connectionFilter()); }
 function updateScope() {
   const addresses=[...visible()].sort(),signature=JSON.stringify(addresses);
   $('session-count').textContent=addresses.length;
@@ -163,8 +207,9 @@ function updateScope() {
   if(signature!==state.scope) { state.scope=signature; state.selected=null; state.messages=[];renderMessages();void loadMessages(); }
 }
 function renderTree() {
+  state.connectedSignature=connectedSignature();
   const previousScroll=$('directory-tree').scrollTop;
-  state.cards.clear();$('directory-tree').replaceChildren();
+  state.cards.clear();state.connectionButtons.clear();$('directory-tree').replaceChildren();
   const query=$('session-search').value.trim().toLocaleLowerCase();
   for(const directory of state.directories) {
     const folder=el('section','directory-node'), heading=el('div','directory-heading');
@@ -175,7 +220,7 @@ function renderTree() {
     });
     title.setAttribute('aria-expanded',String(state.openDirs.has(directory.id)));title.setAttribute('aria-label','展开目录 '+directory.path);
     const text=el('span','folder-text');text.append(el('strong','',display),el('small','',directory.path));
-    title.append(el('span','chevron','›'),el('span','folder-symbol','▰'),text,el('span','count',String(state.sessions.filter(s=>s.directoryIds?.includes(directory.id)).length)));
+    title.append(el('span','chevron','›'),el('span','folder-symbol','▰'),text,el('span','count',String(state.sessions.filter(s=>s.directoryIds?.includes(directory.id)&&matchesConnection(s,directory)).length)));
     const remove=button('×','icon-button remove-directory',async()=>{
       try{const result=await post('/api/directories/remove',{id:directory.id});state.directories=result.directories;state.openDirs.delete(directory.id);rememberTree();await loadSessions(true);}
       catch(error){toast(error.message);}
@@ -193,7 +238,7 @@ function renderTree() {
     if(directory.error)children.append(el('p','directory-error',directory.error));
     for(const client of ['claude','codex']) {
       const groupKey=directory.id+':'+client, group=el('section','client-node '+client);
-      const sessions=state.sessions.filter(s=>s.client===client&&s.directoryIds?.includes(directory.id)&&(!query||(name(s)+' '+s.id).toLocaleLowerCase().includes(query)));
+      const sessions=state.sessions.filter(s=>s.client===client&&s.directoryIds?.includes(directory.id)&&matchesConnection(s,directory)&&(!query||(name(s)+' '+s.id).toLocaleLowerCase().includes(query)));
       const toggle=button('','client-toggle',()=>{
         const open=!state.openClients.has(groupKey);if(open)state.openClients.add(groupKey);else state.openClients.delete(groupKey);
         toggle.setAttribute('aria-expanded',String(open));list.hidden=!open;rememberTree();updateScope();
@@ -201,9 +246,13 @@ function renderTree() {
       toggle.setAttribute('aria-label','展开 '+display+' 的 '+(client==='claude'?'Claude':'Codex'));toggle.setAttribute('aria-expanded',String(state.openClients.has(groupKey)));
       toggle.append(el('span','chevron','›'),el('span','client-mark',client==='claude'?'✳':'⌘'),el('strong','',client==='claude'?'Claude':'Codex'),el('span','count',String(sessions.length)));
       const list=el('div','client-sessions');list.hidden=!state.openClients.has(groupKey);
-      if(!sessions.length)list.append(el('p','group-empty',query?'没有匹配会话':'尚未发现会话'));
+      if(!sessions.length)list.append(el('p','group-empty',query?'没有匹配会话':$('connected-only').checked?'没有已连接会话':'尚未发现会话'));
       for(const session of sessions)list.append(buildCard(session));
-      group.append(toggle,list);children.append(group);
+      const connection=button('检查连接','client-connection checking',()=>showConnectionHelp(client,directory.id));
+      connection.setAttribute('aria-haspopup','dialog');
+      state.connectionButtons.set(groupKey,{button:connection,client,directoryId:directory.id});
+      const groupHeading=el('div','client-heading');groupHeading.append(toggle,connection);
+      group.append(groupHeading,list);children.append(group);
     }
     folder.append(children);$('directory-tree').append(folder);
   }
@@ -297,14 +346,34 @@ async function loadMessages() {
     if(id!==state.messageRequest||state.closed)return;state.messages=result.messages;renderMessages();$('message-error').hidden=true;
   }catch(error){if(id===state.messageRequest){$('message-error').textContent=error.message;$('message-error').hidden=false;}}
 }
+function renderBridge(status) {
+  state.bridgeStatus=status;
+  const badge=$('codex-connection'),display=connectionState('codex');
+  badge.textContent='Codex '+display.label;badge.className='bridge-status '+display.tone;
+  badge.title=(status?.detail||'Codex 连接状态')+'；点击查看连接方法';
+  if(!refreshConnectedFilter())refreshConnections();
+}
+async function loadBridge(force=false) {
+  try { renderBridge(await request('/api/bridge'+(force?'?refresh=1':''))); }
+  catch { renderBridge({connected:false,detail:'管理服务暂不可用，连接恢复后会自动检查。'}); }
+}
 function connectEvents() {
   state.events=new EventSource('/api/events');
-  state.events.addEventListener('open',()=>{$('connection-dot').className='dot connected';$('connection-label').textContent='本地服务在线';});
-  state.events.addEventListener('error',()=>{$('connection-dot').className='dot disconnected';$('connection-label').textContent='服务连接中断';});
+  state.events.addEventListener('bridge',event=>{try{renderBridge(JSON.parse(event.data));}catch{}});
+  state.events.addEventListener('open',()=>{state.serviceOnline=true;void loadBridge();$('connection-dot').className='dot connected';$('connection-label').textContent='本地服务在线';});
+  state.events.addEventListener('error',()=>{state.serviceOnline=false;renderBridge({connected:false,detail:'管理服务暂不可用'});$('connection-dot').className='dot disconnected';$('connection-label').textContent='服务连接中断';});
   let monitorTimer;
   state.events.addEventListener('management',()=>{if(!monitorTimer)monitorTimer=setTimeout(()=>{monitorTimer=null;void loadMonitoring();},250);});
   state.events.addEventListener('message',()=>{clearTimeout(state.messageTimer);state.messageTimer=setTimeout(loadMessages,200);});
 }
+$('codex-connection').addEventListener('click',()=>showConnectionHelp('codex'));
+$('connection-help-close').addEventListener('click',()=>$('connection-dialog').close());
+$('connection-dialog').addEventListener('close',()=>{state.connectionHelp=null;});
+$('connection-recheck').addEventListener('click',async event=>{
+  const target=event.currentTarget;target.disabled=true;target.textContent='正在检查…';
+  try { await loadBridge(true);await loadSessions(true);renderConnectionHelp(); }
+  finally { target.disabled=false;target.textContent='重新检查'; }
+});
 $('directory-form').addEventListener('submit',async event=>{
   event.preventDefault();const path=$('directory').value.trim();if(!path)return;$('add-directory').disabled=true;
   try{const result=await post('/api/directories',{path,recursive:$('recursive').checked});newDirectories(result.directories);$('directory').value='';await loadSessions(true);}
@@ -314,11 +383,16 @@ $('refresh-all').addEventListener('click',()=>loadSessions(true));
 $('collapse-all').addEventListener('click',()=>{state.openDirs.clear();rememberTree();renderTree();});
 let searchTimer;
 $('session-search').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(renderTree,150);});
+$('connected-only').addEventListener('change',()=>{
+  try{localStorage.setItem('cooperation-connected-only-v1',String($('connected-only').checked));}catch{}
+  renderTree();
+});
 $('message-search').addEventListener('input',renderMessages);$('message-status').addEventListener('change',renderMessages);
 let discoverTimer,monitorTimer,messageTimer;
 window.addEventListener('pagehide',()=>{state.closed=true;state.events?.close();clearInterval(discoverTimer);clearInterval(monitorTimer);clearInterval(messageTimer);});
 try {
-  state.config=await request('/api/config');$('version').textContent='v'+state.config.version;
+  try{$('connected-only').checked=localStorage.getItem('cooperation-connected-only-v1')==='true';}catch{}
+  state.config=await request('/api/config');$('version').textContent='v'+state.config.version;renderBridge(state.config.bridge?.codexStatus);
   try{const saved=JSON.parse(localStorage.getItem('cooperation-tree-v1'));if(saved){state.openDirs=new Set(saved.dirs);state.openClients=new Set(saved.clients);state.knownDirs=new Set(saved.known);}}catch{}
   newDirectories(state.config.directories||[]);connectEvents();await loadSessions(true);
   discoverTimer=setInterval(()=>loadSessions(),15000);monitorTimer=setInterval(loadMonitoring,2500);messageTimer=setInterval(loadMessages,10000);

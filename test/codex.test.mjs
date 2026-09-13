@@ -1,3 +1,4 @@
+import { probeCodexBridge } from '../src/adapters/codex.mjs';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -224,4 +225,12 @@ test('unavailable send tool fails before submission, while a lost send response 
   await assert.rejects(sendCodexMessage({ targetId: 'target', text: 'test', context: noTool.context }), { code: 'CODEX_SEND_UNAVAILABLE', outcome: 'not_submitted' });
   const lost = await mockBridge(t, { behavior: 'exit' });
   await assert.rejects(sendCodexMessage({ targetId: 'target', text: 'test', context: lost.context }), { code: 'CODEX_BRIDGE_CLOSED', outcome: 'unknown', retryable: false });
+});
+
+
+test('readiness probe advertises messaging without calling the message tool', async t => {
+  const fixture = await mockBridge(t);
+  assert.deepEqual(await probeCodexBridge(fixture.context), { connected: true });
+  const calls = (await readFile(fixture.logPath, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls.map(r => r.method), ['initialize', 'notifications/initialized', 'tools/list']);
 });

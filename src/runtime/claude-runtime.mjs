@@ -2,6 +2,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { sendClaudeMessage } from '../adapters/claude.mjs';
 
 export class ClaudeRuntime {
   constructor(sessionId, { folder = fileURLToPath(new URL('../../.cooperation/claude-wrapper/instances/', import.meta.url)) } = {}) {
@@ -50,7 +51,26 @@ export class ClaudeRuntime {
     return this.request('/' + kind, { sessionId: this.id, instanceId: now.instanceId, requestId,
       expectedTurnId: now.activeTurnId, expectedActivityRevision: now.activityRevision, ...(text === undefined ? {} : { text }) });
   }
-  async sendControl(text, expected, requestId) { return this.control('prompt', expected, { text, requestId }); }
+  async sendMessage(text, { kind = 'peer', expected, requestId = randomUUID() } = {}) {
+    if (kind === 'maintenance') {
+      if (!expected || expected.activity !== 'idle') return { status: 'state_conflict' };
+      return this.control('prompt', expected, { text, requestId });
+    }
+    if (kind !== 'peer') throw new Error('Invalid Claude message kind.');
+    // Peer delivery is valid while busy and must never invoke interrupt or
+    // pretend that external agent content is a user/maintenance instruction.
+    let visibility;
+    try {
+      const state = await this.status();
+      visibility = { replayEnabled: state.capabilities?.peerMessageVisibility === true,
+        historyEnabled: state.capabilities?.peerHistoryVisibility === true, displayConfirmed: false };
+    } catch { visibility = { replayEnabled: false, historyEnabled: false, displayConfirmed: false }; }
+    const result = await this.sendPeer({ targetId: this.id, text, messageId: requestId });
+    return { ...result, visibility, ...(!visibility.replayEnabled
+      ? { detail: '本次使用普通 peer 通道；接收端尚未启用可见消息，请在工作结束后重新打开已接入的 Claude 面板。' } : {}) };
+  }
+  sendPeer(args) { return sendClaudeMessage(args); }
+  async sendControl(text, expected, requestId) { return this.sendMessage(text, { kind: 'maintenance', expected, requestId }); }
   async interrupt(expected, requestId) { return this.control('interrupt', expected, { requestId }); }
   async compact(expected) {
     const current = await this.status();
@@ -58,4 +78,10 @@ export class ClaudeRuntime {
     return this.request('/compact', { sessionId: this.id, instanceId: current.instanceId, requestId: randomUUID() });
   }
   close() {}
+}
+
+export async function sendVisibleClaudeMessage({ targetId, text, messageId } = {}) {
+  const runtime = new ClaudeRuntime(targetId);
+  try { return await runtime.sendMessage(text, { kind: 'peer', requestId: messageId }); }
+  finally { runtime.close(); }
 }

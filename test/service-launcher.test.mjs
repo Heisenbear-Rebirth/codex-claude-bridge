@@ -7,11 +7,16 @@ import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 const exec = promisify(execFile);
+function isolatedEnvironment(extra = {}) {
+  const env = { ...process.env, ...extra };
+  for (const name of ['CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_THREAD_ID', 'CODEX_MCP_NODE_PATH']) delete env[name];
+  return env;
+}
 test('launchers start once, authenticate shutdown, and stop only their own manager', { skip: process.platform !== 'win32' }, async t => {
   const root = resolve('.');
   const scratch = await mkdtemp(join(root, '.launcher-test-with spaces-'));
   const helper = join(scratch, 'bin', 'coop-service.mjs');
-  const run = action => exec(process.env.ComSpec || 'cmd.exe', ['/d', '/c', action === 'start' ? '启动项目.cmd' : '关闭项目.cmd'], { cwd: scratch, env: { ...process.env, COOP_NO_BROWSER: '1' }, windowsHide: true, timeout: 40000 });
+  const run = action => exec(process.env.ComSpec || 'cmd.exe', ['/d', '/c', action === 'start' ? '启动项目.cmd' : '关闭项目.cmd'], { cwd: scratch, env: isolatedEnvironment({ COOP_NO_BROWSER: '1' }), windowsHide: true, timeout: 40000 });
   t.after(async () => {
     await run('stop').catch(() => {});
     assert.ok(scratch.startsWith(root + '\\') || scratch.startsWith(root + '/'));
@@ -46,7 +51,7 @@ test('stopping the manager preserves an existing Claude transport and permits ne
     throw new Error('Claude fixture did not reach expected state.');
   }
   const manager = action => exec(process.execPath, [join(scratch, 'bin', 'coop-service.mjs'), action], {
-    cwd: scratch, env: { ...process.env, COOP_NO_BROWSER: '1' }, windowsHide: true, timeout: 40000,
+    cwd: scratch, env: isolatedEnvironment({ COOP_NO_BROWSER: '1' }), windowsHide: true, timeout: 40000,
   });
   t.after(async () => {
     await manager('stop').catch(() => {});

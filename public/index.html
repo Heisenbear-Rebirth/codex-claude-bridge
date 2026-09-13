@@ -8,7 +8,7 @@
 <body>
   <header class="app-header">
     <a class="brand" href="/"><span class="brand-icon" aria-hidden="true">⇄</span><span>Cooperation<small>会话协作工作台</small></span></a>
-    <div class="header-status"><span id="connection-dot" class="dot"></span><span id="connection-label">正在连接</span><span class="version" id="version"></span></div>
+    <div class="header-status"><span id="connection-dot" class="dot"></span><span id="connection-label">正在连接</span><button type="button" id="codex-connection" class="bridge-status" aria-haspopup="dialog">Codex 连接中</button><span class="version" id="version"></span></div>
   </header>
   <main>
     <section class="page-heading"><div><p class="eyebrow">WORKSPACE</p><h1>看清进度，安心协作。</h1><p class="intro">用量持续更新；自动压缩由每个会话独立决定。</p></div><div class="overview"><strong id="total-sessions">—</strong><span>个会话</span><i></i><strong id="auto-count">—</strong><span>已开启自动压缩</span></div></section>
@@ -18,6 +18,7 @@
         <div class="panel-heading"><div><h2 id="sessions-title">项目会话 <span id="session-count" class="count">0</span></h2><p>展开目录与客户端，选择右侧通信范围</p></div><button id="refresh-all" class="icon-button" title="重新发现会话" aria-label="重新发现会话" type="button">↻</button></div>
         <form id="directory-form" class="add-directory"><label class="sr-only" for="directory">项目目录</label><input id="directory" placeholder="输入项目完整路径" autocomplete="off" required><button class="button primary" type="submit" id="add-directory">添加目录</button><label class="recursive"><input id="recursive" type="checkbox">包含子目录</label></form>
         <div class="tree-toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="session-search" type="search" placeholder="搜索会话名称或 ID" aria-label="搜索会话名称或 ID"></label><button id="collapse-all" class="text-button" type="button">全部收起</button></div>
+        <label class="connected-filter"><input id="connected-only" type="checkbox">只显示已连接会话</label>
         <div id="tree-empty" class="empty" role="status" hidden></div>
         <div id="directory-tree" class="directory-tree"></div>
         <footer class="panel-footer">用量始终监测 · 设置自动保存</footer>
@@ -35,6 +36,14 @@
     </div>
     <footer class="page-footer">Cooperation <span>原生客户端承载对话，协作信息集中呈现。</span></footer>
   </main>
+  <dialog id="connection-dialog" class="connection-dialog" aria-labelledby="connection-help-title">
+    <header class="connection-dialog-heading"><h2 id="connection-help-title">连接说明</h2><button id="connection-help-close" class="icon-button" type="button" aria-label="关闭连接说明">×</button></header>
+    <p id="connection-help-scope" class="connection-scope"></p>
+    <p id="connection-help-summary" class="connection-summary" role="status"></p>
+    <ol id="connection-help-steps" class="connection-steps"></ol>
+    <p id="connection-help-note" class="connection-note"></p>
+    <footer class="connection-dialog-footer"><button id="connection-recheck" class="button primary" type="button">重新检查</button><span>只刷新状态，不会重启会话</span></footer>
+  </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

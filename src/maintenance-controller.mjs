@@ -6,15 +6,26 @@ import { publicSession } from './address.mjs';
 import { receiptHash } from './checkpoint-service.mjs';
 import { sessionKey } from './management-store.mjs';
 import { handoffPrompt, restorePrompt, continuePrompt } from './maintenance-prompts.mjs';
+import { maintenanceStage, restartCandidate, restartPlan, readRestartEvidence, controlTurnEnded } from './maintenance-recovery.mjs';
+import { normalizeDirectory } from './directory-service.mjs';
 
 const terminal = new Set(['completed', 'cancelled', 'needs_attention', 'user_intervened']);
 const active = s => ['running', 'waiting_permission', 'waiting_input'].includes(s.activity);
 const deadline = ms => new Date(Date.now() + ms).toISOString();
 const stageTimeout = { interrupting: 30000, writing_handoff: 10 * 60_000, awaiting_handoff_end: 60000, compacting: 5 * 60_000, restoring: 5 * 60_000, awaiting_restore_end: 60000 };
 
+function completedClaudeCompaction(cycle, runtime) {
+  const requestId = cycle.compactResult?.requestId;
+  if (!requestId || runtime.lastCompletedTurnId !== requestId) return null;
+  return [runtime.lastCompaction, cycle.compactResult].find(result => result?.status === 'completed'
+    && result.requestId === requestId && (!result.sessionId || result.sessionId === cycle.session.id)
+    && Date.parse(result.completedAt) >= Date.parse(cycle.compactIntentAt)) || null;
+}
+
 export class MaintenanceController {
-  constructor({ root, store, service, monitor, onUpdate = () => {}, intervalMs = 2000 }) {
+  constructor({ root, store, service, monitor, onUpdate = () => {}, intervalMs = 2000, recoveryEvidence = readRestartEvidence }) {
     this.root = root; this.store = store; this.service = service; this.monitor = monitor; this.onUpdate = onUpdate;
+    this.recoveryEvidence = recoveryEvidence; this.recoveryPollAt = new Map();
     this.intervalMs = intervalMs; this.running = new Map(); this.closed = false;
   }
   start() {
@@ -30,7 +41,7 @@ export class MaintenanceController {
     try {
       // Active cycles keep their lock even when a user disables the monitor.
       const cycles = this.store.activeCycles();
-      for (const cycle of cycles.filter(c => !terminal.has(c.state))) void this.advance(cycle.id);
+      for (const cycle of cycles.filter(c => !terminal.has(c.state) || restartCandidate(c))) void this.advance(cycle.id);
       const observed = this.monitor.observeAll ? await this.monitor.observeAll() : null;
       await Promise.allSettled(this.store.policies().filter(p => p.enabled).map(async policy => {
         if (this.closed) return;
@@ -79,21 +90,92 @@ export class MaintenanceController {
     this.running.set(id, task); return task;
   }
   attention(cycle, reason, outcome = 'unknown') {
-    this.store.updateCycle(cycle.id, 'needs_attention', { previousState: cycle.state, reason, lastAttemptOutcome: outcome }); this.onUpdate(cycle.session);
+    this.store.updateCycle(cycle.id, 'needs_attention', { previousState: maintenanceStage(cycle), reason, lastAttemptOutcome: outcome }); this.onUpdate(cycle.session);
   }
   transition(cycle, state, patch = {}) {
     const updated = this.store.updateCycle(cycle.id, state, { deadlineAt: deadline(stageTimeout[state] || 60000), ...patch });
     this.onUpdate(cycle.session); return updated;
   }
+  waitForClient(cycle, reason = '客户端暂不可用，等待重新连接后自动核对接续。') {
+    if (cycle.state === 'waiting_client') return;
+    this.store.updateCycle(cycle.id, 'waiting_client', { previousState: maintenanceStage(cycle), reason,
+      disconnectedAt: new Date().toISOString(), remainingStageMs: Math.max(1000, Date.parse(cycle.deadlineAt) - Date.now()) || 1000 });
+    this.onUpdate(cycle.session);
+  }
+  async recoverClient(cycle, sample) {
+    const runtime = sample.runtime;
+    if (runtime.activity !== 'idle') { this.waitForClient(cycle, '客户端已重连，等待当前轮次结束后核对接续。'); return; }
+    const blocked = reason => {
+      const current = this.store.cycle(cycle.id);
+      if (current?.revision !== cycle.revision) return;
+      this.store.updateCycle(cycle.id, 'needs_attention', { previousState: maintenanceStage(cycle), reason, recoveryBlocked: true });
+      this.onUpdate(cycle.session);
+    };
+    if (runtime.sessionId?.toLowerCase() !== cycle.session.id.toLowerCase()
+      || !runtime.cwd || normalizeDirectory(runtime.cwd) !== normalizeDirectory(cycle.session.cwd))
+      return blocked('重连会话的 ID 或工作目录与原流程不一致。');
+    if (runtime.queuedNativeInputs > 0 || runtime.backgroundTasks > 0 || runtime.subagentHistoryPresent
+      || runtime.goalStatus === 'active' || runtime.pendingRequests > 0 || runtime.pendingClientControls > 0
+      || runtime.pendingHostControls > 0 || runtime.unconfirmedSubmissions > 0 || runtime.capabilities?.automaticMaintenance === false)
+      return blocked('重连后仍有原生队列、目标、权限请求或后台工作，需人工核对。');
+    for (const field of ['model', 'effort', 'permissionMode']) {
+      const current = field === 'model' ? runtime.model || sample.usage?.model : runtime[field];
+      if (cycle.triggerRuntime[field] != null && current != null && current !== cycle.triggerRuntime[field])
+        return blocked('重连后的模型、思考强度或权限选项已改变，需人工核对。');
+    }
+    if (!samePermissionSelection(cycle.triggerRuntime, runtime)) return blocked('重连后的原生权限选项已改变，需人工核对。');
+    const evidence = await this.recoveryEvidence(cycle, sample, { root: this.root });
+    if (evidence.cwd && normalizeDirectory(evidence.cwd) !== normalizeDirectory(cycle.session.cwd)) return blocked('原生历史工作目录与维护会话不一致。');
+    const plan = restartPlan(cycle, evidence, { handoff: this.store.checkpoint(cycle.id, 'handoff'), restored: this.store.checkpoint(cycle.id, 'restored') });
+    if (plan.action === 'wait') { this.waitForClient(cycle, plan.reason); return; }
+    if (plan.action === 'attention') return blocked(plan.reason);
+    if (cycle.documentHash) {
+      try {
+        const allowed = await realpath(cycle.session.cwd), filename = await realpath(cycle.handoffPath), rel = relative(allowed, filename);
+        if (!rel || rel.startsWith('..') || isAbsolute(rel)
+          || createHash('sha256').update(await readFile(filename)).digest('hex') !== cycle.documentHash)
+          return blocked('交付文档位置或内容已经变化，未自动接续。');
+      } catch { return blocked('交付文档暂不可核对，未自动接续。'); }
+    }
+    // Recheck after disk reads so a new native turn or checkpoint cannot be overwritten.
+    const now = await this.monitor.runtime(cycle.session).status(), current = this.store.cycle(cycle.id);
+    if (this.closed || current?.revision !== cycle.revision || now.activity !== 'idle'
+      || now.instanceId !== runtime.instanceId || now.activityRevision !== runtime.activityRevision
+      || now.latestTurn?.id !== runtime.latestTurn?.id) return;
+    const changed = runtime.instanceId !== cycle.triggerRuntime.instanceId;
+    this.store.event('client_reconnected', { id: cycle.id, fromInstance: cycle.triggerRuntime.instanceId,
+      toInstance: runtime.instanceId, stage: plan.stage, resending: plan.resending === true, source: evidence.source });
+    this.transition(current, plan.stage, { ...plan.patch,
+      triggerRuntime: { ...cycle.triggerRuntime, instanceId: runtime.instanceId },
+      recoveryBoundary: plan.endedControl ? { instanceId: runtime.instanceId, activityRevision: runtime.activityRevision, controlTurnId: cycle.controlTurnId } : null,
+      recoveryCount: (cycle.recoveryCount || 0) + Number(changed), recoveryBlocked: false, disconnectedAt: null, reason: null,
+      reconnectedAt: new Date().toISOString() });
+  }
   async step(id) {
-    let cycle = this.store.cycle(id); if (this.closed || !cycle || terminal.has(cycle.state)) return;
-    if (Date.now() > Date.parse(cycle.deadlineAt)) return this.attention(cycle, '维护阶段超时；会话锁及排队消息已保留。');
+    let cycle = this.store.cycle(id);
+    if (this.closed || !cycle || terminal.has(cycle.state) && !restartCandidate(cycle)) return;
+    if (cycle.state === 'waiting_client' || restartCandidate(cycle)) {
+      if (Date.now() < (this.recoveryPollAt.get(id) || 0)) return;
+      this.recoveryPollAt.set(id, Date.now() + 5000);
+    }
     const sample = await this.monitor.sample(cycle.session);
-    cycle = this.store.cycle(id); // A receipt may have committed during the native read.
-    if (!cycle || terminal.has(cycle.state)) return;
-    const state = sample.runtime; if (!state.connected || ['offline', 'unloaded', 'initializing', 'unknown'].includes(state.activity)) return;
+    cycle = this.store.cycle(id);
+    if (!cycle || terminal.has(cycle.state) && !restartCandidate(cycle)) return;
+    const state = sample.runtime;
+    if (!state.connected || ['offline','unloaded','initializing'].includes(state.activity)) { this.waitForClient(cycle); return; }
+    if (state.activity === 'unknown') {
+      if (cycle.state !== 'waiting_client' && Date.now() > Date.parse(cycle.deadlineAt)) this.attention(cycle, '维护阶段超时；会话锁及排队消息已保留。');
+      return;
+    }
     const adapter = this.monitor.runtime(cycle.session);
-    if (cycle.triggerRuntime.instanceId !== state.instanceId) return this.attention(cycle, '原生客户端实例已经改变，请核对原会话状态。');
+    if (cycle.triggerRuntime.instanceId !== state.instanceId) { await this.recoverClient(cycle, sample); return; }
+    if (restartCandidate(cycle)) return; // Same live instance is not permission to resend a failed prompt.
+    if (cycle.state === 'waiting_client') {
+      // A transient disconnect from the same process needs no rebind or replay.
+      this.transition(cycle, cycle.previousState, { reason: null, disconnectedAt: null,
+        deadlineAt: deadline(cycle.remainingStageMs || stageTimeout[cycle.previousState] || 60000) }); return;
+    }
+    if (Date.now() > Date.parse(cycle.deadlineAt)) return this.attention(cycle, '维护阶段超时；会话锁及排队消息已保留。');
     if (state.queuedNativeInputs > 0 || state.backgroundTasks > 0 || state.subagentHistoryPresent) return this.attention(cycle, '检测到原生队列、子agent或后台工作，停止自动推进。');
     if (cycle.triggerRuntime.model && state.model && cycle.triggerRuntime.model !== state.model)
       return this.attention(cycle, '维护期间模型发生变化，请核对用户操作。');
@@ -129,7 +211,7 @@ export class MaintenanceController {
       const stage = cycle.state === 'writing_handoff' ? 'handoff' : 'restored';
       const tokens = this.store.getSetting('cycle-tokens:' + id);
       if (!tokens?.[stage]) return this.attention(cycle, '维护阶段凭证不可用。', 'not_submitted');
-      cycle = this.store.updateCycle(id, cycle.state, { controlDispatched: true, controlTurnId: null, controlIntentAt: new Date().toISOString() });
+      cycle = this.store.updateCycle(id, cycle.state, { controlDispatched: true, controlTurnId: null, recoveryBoundary: null, controlIntentAt: new Date().toISOString() });
       const prompt = stage === 'handoff' ? handoffPrompt(this.root, cycle, tokens[stage]) : restorePrompt(this.root, cycle, tokens[stage]);
       const result = await adapter.sendControl(prompt, state);
       const current = this.store.cycle(id);
@@ -137,26 +219,37 @@ export class MaintenanceController {
       if (result.status !== 'submitted') this.attention(current, '维护提示的投递结果未确认。', result.status === 'state_conflict' ? 'not_submitted' : 'unknown');
       return;
     }
-    const endedControl = state.activity === 'idle' && cycle.controlTurnId && (cycle.session.client === 'claude'
-      ? state.lastCompletedTurnId === cycle.controlTurnId : state.latestTurn?.id === cycle.controlTurnId && state.latestTurn.status !== 'inProgress');
+    const endedControl = controlTurnEnded(cycle, state);
     if (cycle.state === 'awaiting_handoff_end') {
       if (!endedControl) return;
       return this.transition(cycle, 'compacting', { compactDispatched: false, preCompactEpoch: sample.usage?.contextEpoch });
     }
     if (cycle.state === 'compacting') {
       if (cycle.compactDispatched) {
+        const claudeCompletion = cycle.session.client === 'claude' ? completedClaudeCompaction(cycle, state) : null;
         const finished = cycle.session.client === 'claude'
-          ? cycle.compactResult?.status === 'completed' && state.lastCompletedTurnId === cycle.compactResult.requestId
+          ? Boolean(claudeCompletion)
           : sample.usage?.contextEpoch !== cycle.preCompactEpoch && Date.parse(sample.usage?.lastCompactionAt) >= Date.parse(cycle.compactIntentAt)
             && sample.usage.recordedTurnState === 'task_complete' && state.latestTurn?.itemTypes.includes('contextCompaction');
-        if (finished && state.activity === 'idle') return this.transition(cycle, 'restoring', { controlDispatched: false, controlTurnId: null, compactCompletedAt: new Date().toISOString() });
+        if (finished && state.activity === 'idle') return this.transition(cycle, 'restoring', { controlDispatched: false, controlTurnId: null,
+          ...(claudeCompletion ? { compactResult: claudeCompletion } : {}), compactCompletedAt: new Date().toISOString() });
+        const lateResult = state.lastCompaction;
+        if (cycle.session.client === 'claude' && lateResult?.requestId === cycle.compactResult?.requestId
+          && ['failed', 'not_compacted'].includes(lateResult?.status)) {
+          this.store.updateCycle(id, cycle.state, { compactResult: lateResult });
+          return this.attention(cycle, '原生压缩未成功完成。', 'failed');
+        }
         return;
       }
       if (state.activity !== 'idle') return this.attention(cycle, '压缩前出现了新的原生输入。', 'not_submitted');
       cycle = this.store.updateCycle(id, cycle.state, { compactDispatched: true, compactIntentAt: new Date().toISOString() });
       const result = await adapter.compact(state);
       this.store.updateCycle(id, cycle.state, { compactResult: result });
-      if (!['completed', 'acknowledged'].includes(result.status)) this.attention(cycle, '原生压缩失败或结果不确定；没有重复压缩。', result.status === 'failed' ? 'failed' : 'unknown');
+      // The wrapper keeps observing an operation after its HTTP wait expires.
+      // Keep polling that exact request; a timeout is not a compaction failure.
+      const awaitingLateResult = cycle.session.client === 'claude' && result.status === 'unknown' && Boolean(result.requestId);
+      if (!['completed', 'acknowledged'].includes(result.status) && !awaitingLateResult)
+        this.attention(cycle, '原生压缩失败或结果不确定；没有重复压缩。', result.status === 'failed' ? 'failed' : 'unknown');
       return;
     }
     if (cycle.state === 'awaiting_restore_end') {
@@ -188,13 +281,16 @@ export class MaintenanceController {
       controlTurnId: documentStage ? null : cycle.controlTurnId,
       compactDispatched: cycle.previousState === 'compacting' ? false : cycle.compactDispatched,
       interruptDispatched: cycle.previousState === 'interrupting' ? false : cycle.interruptDispatched,
-      triggerRuntime: { ...cycle.triggerRuntime, instanceId: state.instanceId }, reason: null });
+      triggerRuntime: { ...cycle.triggerRuntime, instanceId: state.instanceId }, recoveryBlocked: false, recoveryBoundary: null, reason: null });
     await this.advance(id);
   }
   async reconcile(id) {
     const cycle = this.store.cycle(id);
     if (!cycle || !['needs_attention', 'user_intervened'].includes(cycle.state) || this.running.has(id)) throw new Error('该流程当前无需核对恢复。');
     const sample = await this.monitor.sample(cycle.session), runtime = sample.runtime;
+    if (runtime.connected && runtime.activity === 'idle' && runtime.instanceId !== cycle.triggerRuntime.instanceId) {
+      await this.recoverClient(cycle, sample); return;
+    }
     if (!runtime.connected || runtime.activity !== 'idle' || runtime.instanceId !== cycle.triggerRuntime.instanceId) throw new Error('原生实例未处于可确认的空闲状态。');
     for (const field of ['model', 'effort', 'permissionMode']) {
       if (cycle.triggerRuntime[field] != null && runtime[field] != null && cycle.triggerRuntime[field] !== runtime[field]) throw new Error('原生模型、思考强度或权限选项与触发时不一致。');
@@ -205,9 +301,7 @@ export class MaintenanceController {
     let next, patch = {};
     if (stage === 'compacting') {
       const complete = cycle.session.client === 'claude'
-        ? (cycle.compactResult?.status === 'completed' || runtime.lastCompaction?.status === 'completed')
-          && runtime.lastCompletedTurnId === (cycle.compactResult?.requestId || runtime.lastCompaction?.requestId)
-          && Date.parse(cycle.compactResult?.completedAt || runtime.lastCompaction?.completedAt) >= Date.parse(cycle.compactIntentAt)
+        ? Boolean(completedClaudeCompaction(cycle, runtime))
         : (sample.usage?.contextEpoch !== cycle.preCompactEpoch
         && Date.parse(sample.usage?.lastCompactionAt) >= Date.parse(cycle.compactIntentAt)
         && sample.usage?.recordedTurnState === 'task_complete' && runtime.latestTurn?.itemTypes?.includes('contextCompaction'));
@@ -218,7 +312,7 @@ export class MaintenanceController {
       if (lastTurnId !== cycle.originalTurnId) throw new Error('无法把当前空闲状态与原业务轮次对应。');
       next = 'writing_handoff'; patch = { controlDispatched: false, controlTurnId: null };
     } else if (['awaiting_handoff_end', 'awaiting_restore_end'].includes(stage)) {
-      if (lastTurnId !== cycle.controlTurnId || !this.store.checkpoint(id, stage === 'awaiting_handoff_end' ? 'handoff' : 'restored')) throw new Error('回执或对应控制轮次尚未确认结束。');
+      if (!controlTurnEnded(cycle, runtime) || !this.store.checkpoint(id, stage === 'awaiting_handoff_end' ? 'handoff' : 'restored')) throw new Error('回执或对应控制轮次尚未确认结束。');
       next = stage;
     } else throw new Error('该阶段需要回执；请在核对原会话后重新发送交付／恢复请求。');
     if (cycle.documentHash) {

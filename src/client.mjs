@@ -1,3 +1,4 @@
+import { codexContextFromEnvironment, rememberCodexBridge } from './codex-bridge-connection.mjs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 export async function sendViaManager(root, payload) {
@@ -7,6 +8,7 @@ export async function checkpointViaManager(root, payload) {
   return requestManager(root, '/api/checkpoint', payload);
 }
 async function requestManager(root, endpoint, payload) {
+  if (payload.from?.client === 'codex') await rememberCodexBridge(root, codexContextFromEnvironment(process.env, payload.from.id));
   let connection;
   try { connection = JSON.parse(await readFile(join(root, '.cooperation', 'connection.json'), 'utf8')); }
   catch { throw new Error('管理台尚未启动。请在 Codex 会话的终端运行 node bin/coop.mjs serve。'); }

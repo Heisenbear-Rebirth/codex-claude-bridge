@@ -2,27 +2,31 @@ import { randomUUID } from 'node:crypto';
 import { stat, realpath } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseAddress, publicSession, messageEnvelope } from './address.mjs';
-import { listClaudeSessions, findClaudeSession, sendClaudeMessage } from './adapters/claude.mjs';
+import { listClaudeSessions, findClaudeSession } from './adapters/claude.mjs';
 import { listCodexSessions, findCodexSession, sendCodexMessage } from './adapters/codex.mjs';
 import { SessionMailbox } from './session-mailbox.mjs';
-import { ClaudeRuntime } from './runtime/claude-runtime.mjs';
+import { ClaudeRuntime, sendVisibleClaudeMessage } from './runtime/claude-runtime.mjs';
 import { CodexRuntime } from './runtime/codex-runtime.mjs';
+import { controlTurnEnded } from './maintenance-recovery.mjs';
 
 export class CooperationService {
-  constructor({ store, codexContext, onMessage = () => {}, adapters } = {}) {
-    this.store = store; this.codexContext = codexContext; this.onMessage = onMessage;
+  constructor({ store, codexContext, codexBridge, onMessage = () => {}, adapters } = {}) {
+    this.store = store; this.codexContext = codexContext; this.codexBridge = codexBridge; this.onMessage = onMessage;
     this.adapters = adapters || {
-      claude: { list: listClaudeSessions, find: findClaudeSession, send: sendClaudeMessage },
+      claude: { list: listClaudeSessions, find: findClaudeSession, send: sendVisibleClaudeMessage },
       codex: { list: listCodexSessions, find: findCodexSession, send: sendCodexMessage },
     };
     if (store?.admit) this.mailbox = new SessionMailbox({ store, onMessage,
-      deliverMessage: record => this.adapters[record.to.client].send({ targetId: record.to.id, text: messageEnvelope(record.from, record.text, record.id), messageId: record.id, context: this.codexContext }),
+      deliverMessage: async record => {
+        const context = record.to.client === 'codex' && this.codexBridge ? await this.codexBridge.getContext() : this.codexContext;
+        try { return await this.adapters[record.to.client].send({ targetId: record.to.id, text: messageEnvelope(record.from, record.text, record.id), messageId: record.id, context }); }
+        catch (error) { if (record.to.client === 'codex') this.codexBridge?.invalidate(); throw error; }
+      },
       deliverResume: async item => {
         const runtime = item.to.client === 'codex' ? new CodexRuntime(item.to.id) : new ClaudeRuntime(item.to.id);
         try {
           const current = await runtime.status(); const cycle = store.cycle(item.cycleId);
-          const lastTurn = item.to.client === 'claude' ? current.lastCompletedTurnId : current.latestTurn?.id;
-          if (current.activity !== 'idle' || current.instanceId !== cycle.triggerRuntime.instanceId || lastTurn !== cycle.controlTurnId)
+          if (current.instanceId !== cycle.triggerRuntime.instanceId || !controlTurnEnded(cycle, current))
             return { status: 'failed', error: '恢复业务前原生轮次已改变，请核对是否仍需继续原任务。' };
           return await runtime.sendControl(item.text, current);
         } finally { runtime.close(); }
