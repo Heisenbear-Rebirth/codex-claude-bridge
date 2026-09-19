@@ -1,5 +1,61 @@
 # Validation and supported scope
 
+## Publication checks
+
+The release passes **168 automated tests**. Personal paths and native session identifiers in documentation use generic examples. Local OpenCode configuration, runtime evidence, credentials, dependencies and build outputs are excluded from version control. The tracked `session-lifecycle-cancelled.json` preserves the discontinued lifecycle state in fresh checkouts; regression coverage verifies that no private runtime marker is needed.
+
+## OpenCode automatic maintenance (2026-09-18, current)
+
+The complete suite passes **167 tests**, zero failures. OpenCode now supports per-session soft/hard maintenance policies, native handoff/restored checkpoints bound to ToolContext and the controlling user-message ID, durable control intents, manual native compaction evidence, conditional continuation and FIFO release. New tests cover late/lost responses, forged/wrong-turn receipts, summary errors despite HTTP success, manager/plugin replacement, persisted epochs after history-window truncation, user-input revision conflicts, native settings, permissions and child-session guards. Existing Codex/Claude regressions pass.
+
+An isolated **real OpenCode 1.18.30 backend with a local deterministic model endpoint** completed both soft-idle and hard-running flows. Native write/read tools handled the document; each flow had exactly two completed native checkpoint tool calls and one compaction. Soft maintenance stayed idle; hard maintenance aborted the active generation and continued once. This validates the native protocol, not the reliability of arbitrary external models. Final evidence: `.cooperation/opencode-maintenance-native-result.json`, run root `.cooperation/opencode-maintenance-native-6XPQVE/`.
+
+Isolated Chrome verified capability-gated enablement, threshold autosave, reload persistence, disabling an enabled policy after capability loss, desktop/mobile layout and zero page errors. Evidence: `.cooperation/opencode-maintenance-ui-result.json`, screenshots `.cooperation/opencode-maintenance-ui-Djlxc3/`. Syntax and diff whitespace checks pass.
+
+Native child sessions (including historical children), unresolved permission/question requests and reverted sessions currently block automatic control. Ordinary chat-input coordination is tested; public OpenCode abort has no atomic expected-turn condition, and direct native control paths remain outside a global lock guarantee. New maintenance-specific TUI/desktop-shell rendering and real-provider behavior were not revalidated. Production manager and user native backends were not restarted or upgraded. See [implementation and usage](OPENCODE-MAINTENANCE.md). Earlier test counts and disabled-maintenance descriptions below are historical.
+
+## Lifecycle direction cancelled and external cleanup completed (2026-09-18, current)
+
+The user cancelled proactive native session creation/loading. A 90-file project snapshot and hash manifest preserve the work. The project-local cancellation marker disables lifecycle management capabilities, MCP/OpenCode lifecycle tools, the experimental VS Code bridge and native experiment launch scripts; existing messaging, maintenance receipts and the OpenCode context-display fix remain.
+
+Eighteen attributable external files were backed up, hash-verified and removed: one Claude test transcript, fifteen dedicated VS Code window logs, and two newly created `ext-dev` workspace database files. The original development-host process and its inspector listener no longer exist. Shared VS Code state/cache was not overwritten without a pre-experiment snapshot; no experiment identifiers were found in shared global state. This is not a claim of byte-for-byte rollback of every native runtime artifact.
+
+Eleven isolated regressions for cancellation, messaging, directory guards and context accounting passed. The final check verified all 90 snapshot hashes and 18 backup hashes, no remaining deletion targets, and only `send_message` / `context_checkpoint` in the actual MCP catalog. Syntax checks and `git diff --check` passed. See [cancellation and cleanup record](SESSION-LIFECYCLE-CANCELLED.md). The earlier lifecycle results below are archived progress, not an active development direction or a deployed feature.
+
+## Native lifecycle and OpenCode context display (2026-09-18, latest)
+
+The full suite passes **145 tests**, with zero failures, skips or cancellations. New coverage includes latest-response OpenCode token accounting, actual-model capacity, stale measurements, monitor persistence, authenticated lifecycle tools, CSRF and exact-directory guards, maintenance guards, durable idempotency, conflicting parameters, manager/plugin restart reconciliation, and unknown creation without evidence remaining unknown.
+
+The final identity-case and lifecycle-shutdown guards were followed by **22 passing focused regressions**. The authenticated production status still showed its original PID and start time; exact-project OpenCode discovery returned one session without warnings. All 50 local links in the three handoff/lifecycle documents resolved, and `git diff --check` passed.
+
+An isolated OpenCode **1.18.30** backend created an independent native session with no parentID, returned its address, preserved the operation marker and permission rules, and connected the same ID. Repeated requests did not create duplicates. Restarting only the owned test backend preserved and reconciled that ID. A dedicated prior integration-test session reported **3,962 / 1,000,000 tokens (0.4%)** through the new monitor path. No model was invoked in this lifecycle validation. Evidence: `.cooperation/opencode/lifecycle-validation-result.json`.
+
+Isolated Chrome verified the context number, token counts, model and stale-reading indicator; disabled unsupported creation choices; persistence of an unknown operation across page reload; read-only reconciliation without another create; pre-submission validation allowing correction; and connecting the unchanged native ID. There were no page errors, and the existing cream background was preserved. Evidence: `.cooperation/lifecycle-ui-result.json`, screenshots `.cooperation/lifecycle-ui-PDOn30/`.
+
+Codex/Claude automatic creation and waking unloaded sessions remain unavailable. Their common connect endpoint checks an existing native owner/wrapper without launching or interrupting it. New tool-driven model delegation and new-session TUI/GUI visibility were not exercised. The production manager and current OpenCode plugin were not restarted or hot-updated; deployment remains pending the documented protected-project boundaries. See [lifecycle semantics and next steps](SESSION-LIFECYCLE.md).
+
+## Project drawer and custom workspaces (2026-09-18)
+
+The management UI now uses a compact project sidebar and a selected-project/session workspace. Native clients appear as muted labels on session rows. Selecting a session opens its settings; selecting a project opens its members and aggregate communication scope. Native controls retain their existing endpoints, with accessible switches replacing checkboxes. Phone-sized screens use an overlay navigation drawer and separate message list/detail views.
+
+Named custom projects persist in the management database's `custom-projects-v1` setting. Users select sessions across configured directories, retain offline/missing members, rename groups, and edit membership. A session can belong to multiple groups while keeping one native policy. Mutations require CSRF and expected revision; selected identities resolve from server discovery or that group's existing member snapshots. Deleting a group preserves policies, messages and native sessions. No group operation sends messages or starts maintenance.
+
+All **136 automated tests pass**, with zero failures, skips or cancellations. Four new tests cover database reopen, overlapping cross-directory membership, missing members, exact OpenCode ID case, stale writes/deletes, invalid inputs, HTTP CSRF and communication scope.
+
+The final isolated Chrome run passed 12 interaction checks: flat navigation without checkboxes; session switches and threshold autosave; keyboard member selection preserving order/focus; cross-directory groups; exact communication scope; live message refresh preserving scroll; reload/mode persistence; rename/member edits; connected-only persistence; missing-member behavior; tablet/mobile layout and navigation; group deletion and directory settings. At 1440×960 the sidebar is 292 pixels wide and the workspace occupies the remaining 1148 pixels. The 1024×768 and 390×844 viewports have no document horizontal overflow. No page JavaScript errors occurred. An async button event-lifetime issue found in the first run was fixed and rechecked.
+
+All browser data, profiles, caches and fixture services were project-local. Monitoring was disabled and adapters/runtime were fixtures; no production manager or native business session was started. Report: `.cooperation/workspace-ui-browser-result.json`; final screenshots: `.cooperation/workspace-ui-browser-cbcgU2/`. Pre-change backups, including existing uncommitted OpenCode work, are in `.cooperation/backups/workspace-ui-20260918/`.
+
+## OpenCode communication integration (2026-09-18)
+
+The full suite passes **132 tests**, with no failures, skips or cancellations. Eight new tests cover OpenCode native sender identity, case-sensitive addresses, directory and instance matching, busy transport, durable native IDs across uncertain sends and plugin restart, GUI tree scope, and withholding unsupported maintenance. Source-audit metadata and a concurrent duplicate-submission assertion added afterwards pass all **13 focused regressions**.
+
+Native validation used OpenCode 1.18.30 and official DeepSeek `deepseek-v4-pro`, entirely in project-local data and an isolated manager with monitoring disabled. A 25-second native tool finished normally after a second message was submitted during confirmed busy state. Both markers were acknowledged and the new native message was unique. The formal plugin then completed bidirectional messages between two dedicated sessions, with matching Cooperation/native message IDs.
+
+The **browser GUI** sent a message through its native input and plugin tool; the receiving page displayed the message and response live. Reloading and fully reopening the browser retained the same message without adding native records. The **full TUI** attached through an isolated native PTY to that same backend, displayed existing and live messages, and retained them after closing and reattaching. Restarting the owned test backend preserved the original two mapped native messages. GUI screenshots and terminal output remain in the ignored project-local evidence directory.
+
+The desktop GUI uses the same backend and shared AppInterface; the plugin binds the SDK client supplied by its selected backend, including sidecar authentication. **The desktop application shell, server switching and window reopen have not been exercised.** Its startup includes OS protocol registration, outside this development session's project-only boundary. OpenCode context measurement was added in the latest lifecycle work above; compaction and automatic maintenance remain disabled. See [OpenCode setup and evidence](OPENCODE.md).
+
 Validated on Windows with Node.js 25.2.1, Codex Desktop 26.901.6511.0 / Core 0.153.4, and Claude Code VS Code 2.1.237. These native interfaces may need adaptation after client updates.
 
 ## Automated checks

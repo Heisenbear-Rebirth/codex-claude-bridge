@@ -1,0 +1,11 @@
+{
+  "name": "cooperation-native-sessions",
+  "displayName": "Cooperation Native Sessions",
+  "version": "0.1.0",
+  "publisher": "cooperation-local",
+  "engines": { "vscode": "^1.100.0" },
+  "main": "./extension.cjs",
+  "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["workspace"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false } }
+}

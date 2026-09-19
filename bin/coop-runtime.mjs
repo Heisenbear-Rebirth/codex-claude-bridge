@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
 import { parseAddress } from '../src/address.mjs';
-import { CodexRuntime } from '../src/runtime/codex-runtime.mjs';
-import { ClaudeRuntime } from '../src/runtime/claude-runtime.mjs';
+import { createRuntime } from '../src/runtime/factory.mjs';
 
 const args = process.argv.slice(2);
 const value = flag => { const i = args.indexOf(flag); return i < 0 ? undefined : args[i + 1]; };
 let runtime;
 try {
   const target = parseAddress(value('--to') || '');
-  runtime = target.client === 'codex' ? new CodexRuntime(target.id) : new ClaudeRuntime(target.id);
+  runtime = createRuntime(target);
   const action = args[0];
   if (!['status', 'context', 'prompt', 'interrupt'].includes(action)) throw new Error('Use: coop-runtime.mjs status|context|prompt|interrupt --to client:ID');
   if (action === 'status') console.log(JSON.stringify(await runtime.status(), null, 2));

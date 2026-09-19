@@ -2,6 +2,8 @@ import { join } from 'node:path';
 
 function receiptInstruction(root, cycle, stage, token) {
   const args = { cycleId: cycle.id, stage, receiptToken: token, documentPath: cycle.handoffPath };
+  if (cycle.session.client === 'opencode') return `这是用户在 Cooperation 中启用的上下文维护阶段，沿用本会话原有权限。完成后调用 cooperation_context_checkpoint：${JSON.stringify(args)}\n收到 status=accepted 后结束本轮，等待后续指令；不要自行继续业务或执行额外压缩。`;
+  if (!['codex', 'claude'].includes(cycle.session.client)) throw new Error('此客户端的维护回执尚未开放。');
   const quote = value => "'" + String(value).replaceAll("'", cycle.session.client === 'codex' ? "''" : "'\\''") + "'";
   const entry = join(root, 'bin', 'coop-checkpoint.mjs').replaceAll('\\', '/');
   const command = ['node', /^[a-z0-9_./:-]+$/i.test(entry) ? entry : quote(entry), '--client', cycle.session.client,

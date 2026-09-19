@@ -8,12 +8,15 @@ export const receiptHash = token => createHash('sha256').update(String(token)).d
 function equalHash(a, b) { return typeof a === 'string' && typeof b === 'string' && a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b)); }
 export class CheckpointService {
   constructor({ store, root, onReceipt = () => {} }) { this.store = store; this.root = root; this.onReceipt = onReceipt; }
-  async accept({ from, cycleId, stage, receiptToken, documentPath }) {
+  async accept({ from, cycleId, stage, receiptToken, documentPath }, source) {
     if (!['handoff', 'restored'].includes(stage)) throw new Error('无效的回执阶段。');
     const cycle = this.store.cycle(cycleId);
     if (!cycle || sessionKey(from) !== sessionKey(cycle.session)) throw new Error('回执发送方不属于当前维护流程。');
     if (!equalHash(receiptHash(receiptToken), cycle.receiptHashes?.[stage])) throw new Error('回执凭证不匹配。');
     const existing = this.store.checkpoint(cycleId, stage);
+    if (from.client === 'opencode' && (source?.kind !== 'opencode-tool-context'
+      || source.instanceId !== cycle.triggerRuntime.instanceId || source.nativeUserMessageId !== (existing?.nativeUserMessageId || cycle.controlTurnId)))
+      throw new Error('OpenCode 回执必须来自当前维护控制轮次的原生工具。');
     if (existing) {
       if (documentPath && normalizeDirectory(documentPath) !== normalizeDirectory(existing.documentPath)) throw new Error('重复回执的文档路径发生变化。');
       return { status: 'accepted', cycleId, stage, duplicate: true };
@@ -29,7 +32,8 @@ export class CheckpointService {
     if (!info.isFile() || info.size === 0 || info.size > 2 * 1024 * 1024) throw new Error('交付文档必须是非空文件，且不能超过 2 MiB。');
     const bytes = await readFile(actual); const documentHash = createHash('sha256').update(bytes).digest('hex');
     if (stage === 'restored' && documentHash !== cycle.documentHash) throw new Error('恢复时的交付文档与第一次回执的内容不一致。');
-    const receipt = { at: new Date().toISOString(), from, documentPath: actual, documentHash, bytes: bytes.length, cycleId, stage };
+    const receipt = { at: new Date().toISOString(), from, documentPath: actual, documentHash, bytes: bytes.length, cycleId, stage,
+      ...(from.client === 'opencode' ? { nativeUserMessageId: source.nativeUserMessageId, nativeMessageId: source.nativeMessageId } : {}) };
     const backupDir = join(this.root, '.cooperation', 'handoff-copies', cycleId);
     await mkdir(backupDir, { recursive: true });
     // Only the validated document is copied, always into this project's storage.

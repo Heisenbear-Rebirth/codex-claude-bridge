@@ -1,3 +1,4 @@
+import { managerProcessAlive } from './manager-process.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -10,7 +11,6 @@ const parse = row => row ? JSON.parse(row.data) : null;
 const now = () => new Date().toISOString();
 export const sessionKey = s => `${s.hostId || 'local'}:${s.client}:${s.id || s.sessionId}`;
 const hash = value => createHash('sha256').update(typeof value === 'string' ? value : json(value)).digest('hex');
-const processAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
 
 export class ManagementStore {
   constructor(directory) { this.directory = directory; this.file = join(directory, 'management.sqlite'); this.warnings = []; this.managerToken = null; }
@@ -20,6 +20,7 @@ export class ManagementStore {
     if (this.db.prepare('PRAGMA user_version').get().user_version > 1) { this.db.close(); this.db = null; throw new Error('管理数据库版本高于当前程序，请使用匹配版本。'); }
     this.db.exec(`PRAGMA busy_timeout=2000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS session_operations (key TEXT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS manager (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT NOT NULL, pid INTEGER NOT NULL, epoch INTEGER NOT NULL, started_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS directories (id TEXT PRIMARY KEY, normalized TEXT UNIQUE NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS policies (session_key TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -43,11 +44,30 @@ export class ManagementStore {
   }
   event(type, data) { this.db.prepare('INSERT INTO events(type,at,data) VALUES(?,?,?)').run(type, now(), json(data)); }
   getSetting(key) { return parse(this.db.prepare('SELECT data FROM settings WHERE key=?').get(key)); }
+  reserveLifecycle(input) {
+    return this.transaction(() => {
+      this.assertManager();
+      const old = parse(this.db.prepare('SELECT data FROM session_operations WHERE key=?').get(input.key));
+      if (old) return { ...old, fresh: false };
+      // Unknown is durable before the first external call, including a crash in that call.
+      const record = { ...input, state: 'unknown', createdAt: now(), updatedAt: now(), result: { status: 'unknown', detail: '操作意图已保存，原生结果待核对。' } };
+      this.db.prepare('INSERT INTO session_operations VALUES(?,?,?)').run(record.key, record.state, json(record));
+      return { ...record, fresh: true };
+    });
+  }
+  finishLifecycle(key, result) {
+    this.assertManager();
+    const record = parse(this.db.prepare('SELECT data FROM session_operations WHERE key=?').get(key));
+    if (!record) throw new Error('生命周期操作不存在。');
+    const next = { ...record, state: result.status, result, updatedAt: now() };
+    this.db.prepare('UPDATE session_operations SET state=?,data=? WHERE key=?').run(next.state, json(next), key);
+    return next;
+  }
   setSetting(key, value) { this.db.prepare('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data').run(key, json(value)); }
   acquireManager() {
     return this.transaction(() => {
       const existing = this.db.prepare('SELECT * FROM manager WHERE id=1').get();
-      if (existing && processAlive(existing.pid)) throw new Error('此项目已有管理服务实例；请使用现有服务。');
+      if (existing && managerProcessAlive(existing)) throw new Error('此项目已有管理服务实例；请使用现有服务。');
       this.managerToken = randomUUID();
       this.db.prepare('INSERT INTO manager VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,pid=excluded.pid,epoch=excluded.epoch,started_at=excluded.started_at')
         .run(this.managerToken, process.pid, (existing?.epoch || 0) + 1, now());

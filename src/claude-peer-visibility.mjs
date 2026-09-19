@@ -1,6 +1,6 @@
 // Presentation only: these bytes go to the IDE, never back to Claude.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const ENVELOPE = /^发送方：(codex|claude):\/\/[^\r\n]+:([a-zA-Z0-9_-]{8,128})\r?\n发送方地址：(codex|claude):([a-zA-Z0-9_-]{8,128})\r?\n消息编号：([0-9a-f-]{36})\r?\n\r?\n/gm;
+const ENVELOPE = /^发送方：(codex|claude|opencode):\/\/[^\r\n]+:([a-zA-Z0-9_-]{8,128})\r?\n发送方地址：(codex|claude|opencode):([a-zA-Z0-9_-]{8,128})\r?\n消息编号：([0-9a-f-]{36})\r?\n\r?\n/gm;
 const LABEL = '【Cooperation 会话消息】\n';
 
 export function visiblePeerMessage(message, sessionId) {

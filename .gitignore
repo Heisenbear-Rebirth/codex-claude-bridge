@@ -1,5 +1,7 @@
 .cooperation/
 node_modules/
+/opencode.json
+/opencode.jsonc
 *.log
 
 # Local agent settings, handoffs, native-session evidence and backups
@@ -17,6 +19,7 @@ verification/
 bin/claude-wrapper.exe
 bin/claude-wrapper.paths
 .*-test-*/
+.lifecycle-disabled-*/
 
 # Local evidence maintenance helpers
 scripts/verify-management-migration.mjs

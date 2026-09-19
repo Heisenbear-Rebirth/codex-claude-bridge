@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
+import { readAccessPolicy } from '../access-policy.mjs';
 
 const execFileAsync = promisify(execFile);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -174,6 +175,7 @@ async function verifyRegistryLifetimes(records, warnings) {
 }
 
 async function liveRecords(root, { id, directory, recursive = false } = {}, warnings = []) {
+  const policy = await readAccessPolicy();
   const folder = path.join(root, 'sessions');
   const records = [];
   for (const entry of await directoryEntries(folder)) {
@@ -181,6 +183,7 @@ async function liveRecords(root, { id, directory, recursive = false } = {}, warn
     const filename = path.join(folder, entry.name);
     try {
       const record = await readSmallJson(filename, MAX_REGISTRY_BYTES);
+      if (!policy.permits(record.cwd)) continue;
       if (!UUID.test(record.sessionId ?? '') || record.pid !== Number(entry.name.slice(0, -5))) continue;
       if (id && record.sessionId.toLowerCase() !== id.toLowerCase()) continue;
       if (directory && !withinDirectory(record.cwd, directory, recursive)) continue;
@@ -213,6 +216,7 @@ function combine(metadata, records = []) {
 }
 
 export async function listClaudeSessions({ directory = process.cwd(), recursive = false, configDir } = {}) {
+  const policy = await readAccessPolicy(); policy.assert(directory, recursive);
   const root = configPath(configDir);
   const requestedDirectory = path.resolve(directory);
   const warnings = [];
@@ -258,15 +262,19 @@ export async function listClaudeSessions({ directory = process.cwd(), recursive 
   return { sessions, warnings };
 }
 
-export async function findClaudeSession(id, { configDir } = {}) {
+export async function findClaudeSession(id, { configDir, directory } = {}) {
   if (typeof id !== 'string' || !UUID.test(id)) return null;
   const root = configPath(configDir);
+  const policy = await readAccessPolicy();
+  if (directory) policy.assert(directory);
   const exactId = id.toLowerCase();
-  const records = await liveRecords(root, { id: exactId });
+  const records = await liveRecords(root, { id: exactId, directory });
   const projects = path.join(root, 'projects');
   let metadata;
   for (const project of await directoryEntries(projects)) {
     if (!project.isDirectory()) continue;
+    if (directory && !sameSlug(project.name, projectSlug(directory))) continue;
+    if (policy.denied.some(directory => sameSlug(project.name, projectSlug(directory)) || project.name.toLowerCase().startsWith(projectSlug(directory).toLowerCase() + '-'))) continue;
     const filename = path.join(projects, project.name, `${exactId}.jsonl`);
     try {
       await access(filename);

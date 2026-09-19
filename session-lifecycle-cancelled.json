@@ -1,0 +1,4 @@
+{
+  "disabled": true,
+  "reason": "Proactive native session creation and loading is discontinued. Messaging and context maintenance remain available."
+}

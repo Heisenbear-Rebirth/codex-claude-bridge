@@ -1,14 +1,15 @@
 import { publicSession } from './address.mjs';
-import { CodexRuntime } from './runtime/codex-runtime.mjs';
-import { ClaudeRuntime } from './runtime/claude-runtime.mjs';
+import { createRuntime } from './runtime/factory.mjs';
 import { IncrementalContextReader } from './context-usage.mjs';
 import { evaluatePolicy } from './context-policy.mjs';
 import { sessionKey } from './management-store.mjs';
+import { readAccessPolicy } from './access-policy.mjs';
 
 export class ContextMonitor {
   constructor({ store, service, runtimeFactory, onUpdate = () => {} }) {
     this.store = store; this.service = service; this.onUpdate = onUpdate; this.clients = new Map(); this.readers = new Map();
-    this.runtimeFactory = runtimeFactory || (session => session.client === 'codex' ? new CodexRuntime(session.id) : new ClaudeRuntime(session.id));
+    this.injectedRuntime = Boolean(runtimeFactory);
+    this.runtimeFactory = runtimeFactory || (session => createRuntime(session, { opencode: service.adapters?.opencode }));
     this.inFlight = new Map(); this.discovered = []; this.discoveryAt = 0; this.discoverySignature = ''; this.closed = false;
     this.nextSampleAt = new Map(); this.nativeQueryAt = new Map();
   }
@@ -45,6 +46,10 @@ export class ContextMonitor {
     const work = this.readSample(session, native).finally(() => this.inFlight.delete(key)); this.inFlight.set(key, work); return work;
   }
   async readSample(session, native) {
+    const access = await readAccessPolicy();
+    const metadata = session.cwd ? session : await this.service.adapters?.[session.client]?.find(session.id);
+    if (metadata?.cwd) access.assert(metadata.cwd);
+    else if (!this.injectedRuntime) throw new Error('无法在获准目录内确认该会话，停止原生观察。');
     const key = sessionKey(session), adapter = this.runtime(session);
     let runtime, usage, error;
     try {
@@ -57,12 +62,14 @@ export class ContextMonitor {
           try { usage = (await adapter.context()).usage; runtime = await adapter.status(); usage = runtime.usage || usage; }
           catch (e) { error = e.message; }
         }
-      } else {
+      } else if (session.client === 'opencode') {
+        usage = runtime.usage;
+      } else if (session.client === 'codex') {
         if (!this.readers.has(key)) this.readers.set(key, new IncrementalContextReader(session.client, session.id));
         try { usage = await this.readers.get(key).read(); } catch (e) { error = e.message; }
       }
     } catch (e) { error = e.message; runtime = { connected: false, activity: 'offline', observedAt: new Date().toISOString(), capabilities: {} }; this.clients.delete(key); adapter.close(); }
-    if (!usage) {
+    if (!usage && ['codex', 'claude'].includes(session.client)) {
       try {
         if (!this.readers.has(key)) this.readers.set(key, new IncrementalContextReader(session.client, session.id));
         usage = await this.readers.get(key).read();

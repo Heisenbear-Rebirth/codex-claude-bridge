@@ -54,13 +54,21 @@ test('service logs before delivery, adds real sender, and records uncertain fail
   assert.deepEqual(Object.keys(result).sort(), ['error', 'messageId', 'status', 'to']);
 });
 
-test('MCP exposes message and checkpoint tools, not discovery or history', async () => {
-  const child = spawn(process.execPath, ['bin/coop.mjs', 'mcp', '--client', 'codex'], { cwd: resolve('.'), windowsHide: true });
+test('MCP exposes scoped lifecycle, message and checkpoint tools without discovery or history', async t => {
+  const root = await mkdtemp(join(resolve('.'), '.mcp-test-'));t.after(() => rm(root,{recursive:true,force:true}));
+  const script = `import {startMcp} from './src/mcp.mjs';startMcp({root:${JSON.stringify(root)},client:'codex'});`;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', script], { cwd: resolve('.'), windowsHide: true });
   let output = '';
   child.stdout.on('data', (chunk) => { output += chunk; });
   child.stdin.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) + '\n');
   await new Promise((done, reject) => { child.on('error', reject); child.on('close', done); });
   const result = JSON.parse(output.trim()).result;
-  assert.deepEqual(result.tools.map((tool) => tool.name), ['send_message', 'context_checkpoint']);
+  assert.deepEqual(result.tools.map((tool) => tool.name), ['send_message', 'context_checkpoint', 'create_session', 'connect_session']);
   assert.deepEqual(Object.keys(result.tools[0].inputSchema.properties), ['to', 'message']);
+  for (const tool of result.tools.slice(2)) {
+    assert.equal(tool.inputSchema.additionalProperties, false);
+    assert.ok(tool.inputSchema.required.includes('requestId'));
+    assert.ok(tool.inputSchema.required.includes('directory'));
+    assert.equal(tool.inputSchema.properties.from, undefined);
+  }
 });

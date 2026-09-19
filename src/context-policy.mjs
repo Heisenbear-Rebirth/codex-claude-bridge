@@ -1,4 +1,4 @@
-export const POLICY_DEFAULTS = { codex: { softPercent: 40, hardPercent: 55 }, claude: { softPercent: 50, hardPercent: 80 } };
+export const POLICY_DEFAULTS = { codex: { softPercent: 40, hardPercent: 55 }, claude: { softPercent: 50, hardPercent: 80 }, opencode: { softPercent: 50, hardPercent: 80 } };
 export function validatePolicy(policy) {
   const { softPercent: soft, hardPercent: hard } = policy;
   if (typeof soft !== 'number' || typeof hard !== 'number' || !Number.isFinite(soft) || !Number.isFinite(hard)
@@ -8,11 +8,15 @@ export function validatePolicy(policy) {
 }
 export function evaluatePolicy({ policy, runtime, usage, cycle, lastCycle } = {}) {
   const decision = (action, reason, extra = {}) => ({ action, reason, ...extra });
+  if (runtime?.capabilities?.automaticMaintenance === false || policy?.session?.client === 'opencode' && runtime?.capabilities?.automaticMaintenance !== true)
+    return decision('disabled', '原生维护能力尚未就绪，请加载新版插件并刷新状态。');
   if (!policy?.enabled) return decision('disabled', '此会话未启用自动管理。');
   if (cycle) return decision('maintenance', '正在进行上下文维护。');
   if (!runtime?.connected || !['idle', 'running', 'waiting_permission', 'waiting_input'].includes(runtime.activity)) return decision('wait', '等待可用的原生活动状态。');
   if (!usage || !Number.isFinite(usage.usedTokens) || !(usage.contextWindowTokens > 0)) return decision('wait', '上下文用量或模型容量未知。');
-  if (usage.historyChangedAfterMeasurement) return decision('wait', '等待本轮新的上下文统计。');
+  if (usage.historyChangedAfterMeasurement && !(policy?.session?.client === 'opencode' && usage.maintenanceMeasurementValid)) return decision('wait', '等待本轮新的上下文统计。');
+  if (policy?.session?.client === 'opencode' && (runtime.pendingRequests || runtime.queuedNativeInputs || runtime.subagentHistoryPresent || runtime.reverted))
+    return decision('wait', '等待原生权限、输入、子任务或回滚状态处理完成。');
   const percent = usage.usedTokens * 100 / usage.contextWindowTokens;
   const active = runtime.activity !== 'idle';
   if (percent < policy.softPercent) return decision('monitor', '低于空闲阈值。', { percent });

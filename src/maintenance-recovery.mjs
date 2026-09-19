@@ -14,7 +14,9 @@ export function restartCandidate(cycle) {
     || ['CLAUDE_CONNECTION_LOST', 'CLAUDE_OFFLINE', 'CODEX_CONNECTION_LOST'].includes(cycle.reason));
 }
 export function controlTurnEnded(cycle, state) {
+  if (!['codex', 'claude', 'opencode'].includes(cycle.session.client)) return false;
   if (state.activity !== 'idle' || !cycle.controlTurnId) return false;
+  if (cycle.session.client === 'opencode') return state.latestTurn?.id === cycle.controlTurnId && state.latestTurn.status === 'completed';
   if (cycle.session.client !== 'claude') return state.latestTurn?.id === cycle.controlTurnId && ['completed','interrupted','failed'].includes(state.latestTurn.status);
   if (state.lastCompletedTurnId === cycle.controlTurnId) return true;
   const proof = cycle.recoveryBoundary;
@@ -44,6 +46,14 @@ async function scan(file, visit, maximum = 128 * 1024 * 1024) {
 }
 // Only selected-session evidence is returned; no chat text, tokens or account data.
 export async function readRestartEvidence(cycle, sample, { root, configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude') } = {}) {
+  if (cycle.session.client === 'opencode') {
+    const state = sample.runtime, turn = state.latestTurn, result = state.lastCompaction;
+    return { verified: state.activity === 'idle' && Boolean(turn?.id) && ['completed','failed','interrupted'].includes(turn.status),
+      terminal: ['completed','failed','interrupted'].includes(turn?.status), lastInputId: turn?.id, source: 'opencode-native-messages', cwd: state.cwd,
+      compactCompleted: result?.status === 'completed' && result.requestId === (cycle.compactResult?.requestId || cycle.compactRequestId)
+        && result.nativeMessageId === turn?.id && Date.parse(result.completedAt) >= Date.parse(cycle.compactIntentAt) };
+  }
+  if (!['codex', 'claude'].includes(cycle.session.client)) return { verified: false, reason: 'unsupported_client' };
   if (cycle.session.client === 'codex') {
     const turn = sample.runtime.latestTurn, usage = sample.usage;
     return { verified: Boolean(turn?.id) && ['completed','interrupted','failed'].includes(turn?.status), lastInputId: turn?.id, terminal: ['completed','interrupted','failed'].includes(turn?.status),
@@ -121,5 +131,6 @@ export function restartPlan(cycle, evidence, { handoff, restored } = {}) {
   const received = restoring ? restored : handoff;
   if (received) return { action: 'resume', stage: restoring ? 'awaiting_restore_end' : 'awaiting_handoff_end', patch: {}, endedControl: true };
   if (stage.startsWith('awaiting_')) return fail('对应阶段回执缺失，需人工核对。');
+  if (cycle.session.client === 'opencode' && cycle.controlDispatched) return fail('原生维护提示已提交但回执缺失；保持队列，需核对后手动重试。');
   return { action: 'resume', stage, patch: { controlDispatched: false, controlTurnId: null }, resending: true };
 }

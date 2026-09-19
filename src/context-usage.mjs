@@ -10,6 +10,7 @@ const sum = values => values.every(value => value !== null) ? values.reduce((a, 
 const percentage = (used, size) => used !== null && size > 0 ? Math.round(used / size * 10000) / 100 : null;
 
 export function createUsageAccumulator(client, id) {
+  if (!['codex', 'claude'].includes(client)) throw new Error('Recorded context is not supported for this client.');
   let latest = null, latestBoundary = null, model = null, lifecycle = null, pendingHistoryChange = false;
   let knownWindow = null, windowModel = null, pendingWindow = null;
   const usageFields = ['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'];
@@ -97,6 +98,7 @@ export async function readRecordedContext({ client, id }) {
   return readUsageFile({ client, id, filename: await contextSourcePath({ client, id }) });
 }
 export async function contextSourcePath({ client, id }) {
+  if (!['codex', 'claude'].includes(client)) throw new Error('Recorded context is not supported for this client.');
   let filename;
   if (client === 'claude') {
     const { findClaudeSession } = await import('./adapters/claude.mjs');

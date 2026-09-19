@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">Cooperation</title>
+  <desc id="description">Two linked arcs joined by a bridge, representing connected conversations.</desc>
+  <defs>
+    <linearGradient id="green" x1="8" y1="4" x2="54" y2="64" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#328c7e"/>
+      <stop offset="1" stop-color="#195e55"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="62" height="62" rx="18" fill="url(#green)"/>
+  <g transform="rotate(-35 32 32)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M30 22h-5a10 10 0 0 0 0 20h5" stroke="#fff"/>
+    <path d="M34 22h5a10 10 0 0 1 0 20h-5" stroke="#c4eee2"/>
+    <path d="M25 32h14" stroke="#fff"/>
+  </g>
+</svg>

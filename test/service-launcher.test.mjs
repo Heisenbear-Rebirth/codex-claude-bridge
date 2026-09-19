@@ -6,6 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
+import { ManagementStore } from '../src/management-store.mjs';
 const exec = promisify(execFile);
 function isolatedEnvironment(extra = {}) {
   const env = { ...process.env, ...extra };
@@ -24,7 +25,16 @@ test('launchers start once, authenticate shutdown, and stop only their own manag
   });
   for (const folder of ['src', 'bin', 'public']) await cp(join(root, folder), join(scratch, folder), { recursive: true });
   for (const filename of ['启动项目.cmd', '关闭项目.cmd']) await cp(join(root, filename), join(scratch, filename));
+  // A lock from a previous boot now points to a live unrelated process (this test).
+  // Its PID is alive, but its creation time is later than the old lock.
+  const staleStore = await new ManagementStore(join(scratch, '.cooperation')).init();
+  staleStore.db.prepare('INSERT INTO manager VALUES(1,?,?,?,?)').run('old-boot', process.pid, 1, '2000-01-01T00:00:00.000Z');
+  staleStore.setSetting('preserved-fixture', { value: 'keep' }); staleStore.close();
   const first = await run('start'); assert.match(first.stdout, /Started:/);
+  const auditStore = await new ManagementStore(join(scratch, '.cooperation')).init();
+  assert.deepEqual(auditStore.getSetting('preserved-fixture'), { value: 'keep' });
+  assert.throws(() => auditStore.acquireManager(), /已有管理服务/);
+  auditStore.close();
   const filename = join(scratch, '.cooperation', 'connection.json');
   const before = JSON.parse(await readFile(filename, 'utf8'));
   const again = await run('start'); assert.match(again.stdout, /Already running:/);

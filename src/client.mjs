@@ -7,6 +7,9 @@ export async function sendViaManager(root, payload) {
 export async function checkpointViaManager(root, payload) {
   return requestManager(root, '/api/checkpoint', payload);
 }
+export async function lifecycleViaManager(root, payload) {
+  return requestManager(root, '/api/lifecycle', payload);
+}
 async function requestManager(root, endpoint, payload) {
   if (payload.from?.client === 'codex') await rememberCodexBridge(root, codexContextFromEnvironment(process.env, payload.from.id));
   let connection;

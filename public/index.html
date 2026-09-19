@@ -2,48 +2,36 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light"><title>Cooperation · 会话与上下文</title>
+  <meta name="color-scheme" content="light"><title>Cooperation · 协作空间</title>
   <link rel="stylesheet" href="/styles.css"><script type="module" src="/app.js"></script>
 </head>
 <body>
-  <header class="app-header">
-    <a class="brand" href="/"><span class="brand-icon" aria-hidden="true">⇄</span><span>Cooperation<small>会话协作工作台</small></span></a>
-    <div class="header-status"><span id="connection-dot" class="dot"></span><span id="connection-label">正在连接</span><button type="button" id="codex-connection" class="bridge-status" aria-haspopup="dialog">Codex 连接中</button><span class="version" id="version"></span></div>
-  </header>
-  <main>
-    <section class="page-heading"><div><p class="eyebrow">WORKSPACE</p><h1>看清进度，安心协作。</h1><p class="intro">用量持续更新；自动压缩由每个会话独立决定。</p></div><div class="overview"><strong id="total-sessions">—</strong><span>个会话</span><i></i><strong id="auto-count">—</strong><span>已开启自动压缩</span></div></section>
+  <aside id="sidebar" class="sidebar" aria-label="项目与会话">
+    <header class="sidebar-brand"><a class="brand" href="/"><svg class="brand-icon brand-logo" viewBox="0 0 64 64" fill="none" aria-hidden="true"><defs><linearGradient id="brand-green" x1="8" y1="4" x2="54" y2="64" gradientUnits="userSpaceOnUse"><stop stop-color="#328c7e"/><stop offset="1" stop-color="#195e55"/></linearGradient></defs><rect x="1" y="1" width="62" height="62" rx="18" fill="url(#brand-green)"/><g transform="rotate(-35 32 32)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M30 22h-5a10 10 0 0 0 0 20h5" stroke="#fff"/><path d="M34 22h5a10 10 0 0 1 0 20h-5" stroke="#c4eee2"/><path d="M25 32h14" stroke="#fff"/></g></svg>Cooperation</a><button id="sidebar-close" class="icon-button mobile-only" aria-label="关闭项目导航" type="button">×</button></header>
+    <div class="segmented mode-switch" role="group" aria-label="项目模式"><button id="mode-directories" type="button" aria-pressed="true">目录项目</button><button id="mode-custom" type="button" aria-pressed="false">自定义项目</button></div>
+    <label class="search sidebar-search"><span aria-hidden="true">⌕</span><input id="session-search" type="search" placeholder="搜索项目或会话" aria-label="搜索项目或会话"></label>
+    <div class="sidebar-tools"><span id="navigation-label">项目</span><div><button id="connected-only" class="filter-button" type="button" aria-pressed="false" title="只显示已连接会话">已连接</button><button id="collapse-all" class="icon-button" aria-label="收起全部项目" title="收起全部项目" type="button">⌃</button><button id="add-project" class="icon-button" aria-label="添加目录" title="添加目录" type="button">＋</button></div></div>
+    <nav id="directory-tree" class="directory-tree" aria-label="会话导航"></nav>
+    <footer class="sidebar-footer"><span><span id="connection-dot" class="dot"></span><span id="connection-label">正在连接</span></span><button id="refresh-all" class="icon-button" title="刷新会话" aria-label="刷新会话" type="button">↻</button></footer>
+  </aside>
+  <button id="sidebar-scrim" class="sidebar-scrim" aria-label="关闭项目导航" type="button" hidden></button>
+  <main class="main-pane">
+    <header class="workspace-toolbar"><div class="breadcrumb"><button id="sidebar-toggle" class="icon-button" type="button" aria-label="切换项目导航" aria-expanded="true">☰</button><button id="project-crumb" type="button">协作空间</button><span id="session-crumb"></span></div><div class="toolbar-actions"><button id="codex-connection" class="bridge-status" type="button">Codex 连接中</button><span id="version" class="version"></span></div></header>
     <div id="global-error" class="notice error" role="alert" hidden></div>
-    <div class="workspace">
-      <section class="panel sessions-panel" aria-labelledby="sessions-title">
-        <div class="panel-heading"><div><h2 id="sessions-title">项目会话 <span id="session-count" class="count">0</span></h2><p>展开目录与客户端，选择右侧通信范围</p></div><button id="refresh-all" class="icon-button" title="重新发现会话" aria-label="重新发现会话" type="button">↻</button></div>
-        <form id="directory-form" class="add-directory"><label class="sr-only" for="directory">项目目录</label><input id="directory" placeholder="输入项目完整路径" autocomplete="off" required><button class="button primary" type="submit" id="add-directory">添加目录</button><label class="recursive"><input id="recursive" type="checkbox">包含子目录</label></form>
-        <div class="tree-toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="session-search" type="search" placeholder="搜索会话名称或 ID" aria-label="搜索会话名称或 ID"></label><button id="collapse-all" class="text-button" type="button">全部收起</button></div>
-        <label class="connected-filter"><input id="connected-only" type="checkbox">只显示已连接会话</label>
-        <div id="tree-empty" class="empty" role="status" hidden></div>
-        <div id="directory-tree" class="directory-tree"></div>
-        <footer class="panel-footer">用量始终监测 · 设置自动保存</footer>
-      </section>
-      <section class="panel messages-panel" aria-labelledby="messages-title">
-        <div class="panel-heading"><div><h2 id="messages-title">通信记录 <span id="message-count" class="count">0</span></h2><p id="message-scope">展开左侧会话，查看相关通信</p></div><span class="live-label"><span class="dot connected"></span>自动更新</span></div>
-        <div class="message-toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="message-search" type="search" placeholder="搜索消息、会话名称或 ID" aria-label="搜索通信记录"></label><select id="message-status" aria-label="筛选投递状态"><option value="all">全部状态</option><option value="submitted">已提交</option><option value="queued">已排队</option><option value="unknown">待确认</option><option value="failed">发送失败</option><option value="held">已保留</option></select></div>
-        <div id="message-error" class="notice error" role="alert" hidden></div>
-        <div class="message-layout">
-          <div class="message-feed"><div id="message-empty" class="empty" role="status"></div><ul id="message-list" class="message-list" aria-label="相关通信消息"></ul></div>
-          <article id="message-detail" class="message-detail" aria-label="消息详情"></article>
-        </div>
-        <footer class="panel-footer"><span>仅展示经本工具发送的消息</span><span>发送方或接收方匹配即可</span></footer>
-      </section>
-    </div>
-    <footer class="page-footer">Cooperation <span>原生客户端承载对话，协作信息集中呈现。</span></footer>
+    <section class="workspace-heading"><div class="heading-copy"><p id="workspace-kicker" class="eyebrow">协作空间</p><h1 id="workspace-title">选择一个项目</h1><p id="workspace-subtitle" class="subtitle">在左侧选择项目或会话，开始整理你的协作。</p></div><div id="workspace-actions" class="workspace-actions"></div></section>
+    <div class="workspace-tabs" role="tablist" aria-label="工作区视图"><button id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="overview-panel">项目概览</button><button id="tab-messages" type="button" role="tab" aria-selected="false" aria-controls="messages-panel">通信记录 <span id="message-count" class="count">0</span></button></div>
+    <section id="overview-panel" class="overview-panel" role="tabpanel" aria-labelledby="tab-overview"><div id="inspector"></div></section>
+    <section id="messages-panel" class="messages-panel" role="tabpanel" aria-labelledby="tab-messages" hidden>
+      <div class="message-toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="message-search" type="search" placeholder="搜索通信内容" aria-label="搜索通信记录"></label><select id="message-status" aria-label="筛选投递状态"><option value="all">全部状态</option><option value="submitted">已提交</option><option value="queued">已排队</option><option value="unknown">待确认</option><option value="failed">发送失败</option><option value="held">已保留</option></select></div>
+      <p id="message-scope" class="message-scope"></p><div id="message-error" class="notice error" role="alert" hidden></div>
+      <div class="message-layout"><div class="message-feed"><div id="message-empty" class="empty" role="status"></div><ul id="message-list" class="message-list" aria-label="相关通信消息"></ul></div><article id="message-detail" class="message-detail" aria-label="消息详情"></article></div>
+    </section>
   </main>
-  <dialog id="connection-dialog" class="connection-dialog" aria-labelledby="connection-help-title">
-    <header class="connection-dialog-heading"><h2 id="connection-help-title">连接说明</h2><button id="connection-help-close" class="icon-button" type="button" aria-label="关闭连接说明">×</button></header>
-    <p id="connection-help-scope" class="connection-scope"></p>
-    <p id="connection-help-summary" class="connection-summary" role="status"></p>
-    <ol id="connection-help-steps" class="connection-steps"></ol>
-    <p id="connection-help-note" class="connection-note"></p>
-    <footer class="connection-dialog-footer"><button id="connection-recheck" class="button primary" type="button">重新检查</button><span>只刷新状态，不会重启会话</span></footer>
-  </dialog>
+  <dialog id="directory-dialog" aria-labelledby="directory-title"><form id="directory-form"><header class="dialog-heading"><h2 id="directory-title">添加目录</h2><button class="icon-button" data-close="directory-dialog" type="button" aria-label="关闭目录设置">×</button></header><p class="dialog-description">从目录发现已有的原生会话。</p><label class="field-label" for="directory">项目路径</label><input id="directory" class="text-input" placeholder="输入项目完整路径" autocomplete="off" required><label class="field-label" for="directory-label">显示名称 <span class="muted">可选</span></label><input id="directory-label" class="text-input" maxlength="200" placeholder="默认使用文件夹名称"><div class="setting-row"><div><strong>包含子目录</strong><p>同时发现下级目录中的会话</p></div><button id="recursive" class="switch" type="button" role="switch" aria-checked="false" aria-label="包含子目录"></button></div><div id="directory-control-row" class="setting-row" hidden><div><strong>Claude 控制接入</strong><p>允许原生状态与控制连接，重开面板生效</p></div><button id="directory-control" class="switch" type="button" role="switch" aria-checked="false" aria-label="Claude 控制接入"></button></div><div id="directory-error" class="notice error" role="alert" hidden></div><footer class="dialog-footer"><button id="remove-directory" class="button danger" type="button" hidden>移除目录</button><span class="spacer"></span><button class="button" data-close="directory-dialog" type="button">取消</button><button id="save-directory" class="button primary" type="submit">保存</button></footer></form></dialog>
+  <dialog id="group-dialog" class="group-dialog" aria-labelledby="group-title"><form id="group-form"><header class="dialog-heading"><h2 id="group-title">新建自定义项目</h2><button class="icon-button" data-close="group-dialog" type="button" aria-label="关闭分组编辑">×</button></header><p class="dialog-description">挑选需要一起工作的会话，可以来自不同目录。</p><label class="field-label" for="group-name">项目名称</label><input id="group-name" class="text-input" maxlength="80" placeholder="例如：产品研发、论文审阅" required><div class="picker-toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="member-search" type="search" placeholder="搜索名称、目录或客户端" aria-label="搜索可选会话"></label><span id="member-count" class="muted">已选 0</span></div><div id="member-list" class="member-list" role="group" aria-label="选择项目成员"></div><p class="small muted">点击会话即可加入或移出；离线成员会保留在组内。</p><div id="group-error" class="notice error" role="alert" hidden></div><footer class="dialog-footer"><button id="delete-group" class="button danger" type="button" hidden>删除分组</button><span class="spacer"></span><button class="button" data-close="group-dialog" type="button">取消</button><button id="save-group" class="button primary" type="submit">保存项目</button></footer></form></dialog>
+  <dialog id="connection-dialog" aria-labelledby="connection-help-title"><header class="dialog-heading"><h2 id="connection-help-title">连接说明</h2><button class="icon-button" data-close="connection-dialog" type="button" aria-label="关闭连接说明">×</button></header><p id="connection-help-scope" class="connection-scope"></p><p id="connection-help-summary" class="connection-summary" role="status"></p><ol id="connection-help-steps" class="connection-steps"></ol><p id="connection-help-note" class="small muted"></p><footer class="dialog-footer"><button id="connection-recheck" class="button primary" type="button">重新检查</button><span class="small muted">刷新连接状态</span></footer></dialog>
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title"><form id="confirm-form"><h2 id="confirm-title"></h2><p id="confirm-description" class="dialog-description"></p><footer class="dialog-footer"><button class="button" data-close="confirm-dialog" type="button">取消</button><button class="button danger" type="submit">确认移除</button></footer></form></dialog>
+  <dialog id="lifecycle-dialog" aria-labelledby="lifecycle-title"><form id="lifecycle-form"><header class="dialog-heading"><h2 id="lifecycle-title">新建原生会话</h2><button class="icon-button" data-close="lifecycle-dialog" type="button" aria-label="关闭会话操作">×</button></header><p id="lifecycle-description" class="dialog-description"></p><label class="field-label" for="lifecycle-directory">项目目录</label><input id="lifecycle-directory" class="text-input" readonly required><div id="lifecycle-create-fields"><label class="field-label" for="lifecycle-client">原生客户端</label><select id="lifecycle-client" class="text-input"><option value="opencode">OpenCode</option><option value="codex">Codex</option><option value="claude">Claude Code</option></select><label class="field-label" for="lifecycle-name">会话名称 <span class="muted">可选</span></label><input id="lifecycle-name" class="text-input" maxlength="120"></div><div id="lifecycle-connect-fields" hidden><label class="field-label" for="lifecycle-address">会话地址</label><input id="lifecycle-address" class="text-input" placeholder="客户端:原生会话ID"></div><p id="lifecycle-capability" class="small muted"></p><p id="lifecycle-result" class="connection-summary" role="status"></p><div id="lifecycle-error" class="notice error" role="alert" hidden></div><footer class="dialog-footer"><button id="lifecycle-copy" class="button" type="button" hidden>复制地址</button><span class="spacer"></span><button class="button" data-close="lifecycle-dialog" type="button">关闭</button><button id="lifecycle-submit" class="button primary" type="submit">新建会话</button></footer></form></dialog>
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

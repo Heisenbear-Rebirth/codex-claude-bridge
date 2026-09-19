@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { startServer } from '../src/http-server.mjs';
 import { startMcp } from '../src/mcp.mjs';
 import { detectSender } from '../src/identity.mjs';
-import { sendViaManager, checkpointViaManager } from '../src/client.mjs';
+import { sendViaManager, checkpointViaManager, lifecycleViaManager } from '../src/client.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const [command = 'help', ...args] = process.argv.slice(2);
 function option(name) { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; }
@@ -30,8 +30,14 @@ try {
     const result = await sendViaManager(root, { from, to: option('--to'), message });
     console.log(JSON.stringify(result, null, 2));
     if (result.status === 'failed') process.exitCode = 1;
+  } else if (command === 'session' && ['create','connect'].includes(args[0])) {
+    const from = await detectSender({ client: option('--client') });
+    const result = await lifecycleViaManager(root, { from, action: args[0], args: { requestId: option('--request-id'), directory: option('--directory'),
+      ...(args[0] === 'create' ? { client: option('--target-client'), ...(option('--title') ? { title: option('--title') } : {}), ...(option('--prompt') ? { prompt: option('--prompt') } : {}) } : { to: option('--to') }) } });
+    console.log(JSON.stringify(result, null, 2));
+    if (!['created','connected'].includes(result.status)) process.exitCode = 1;
   } else {
-    console.log('Cooperation\n\n  node bin/coop.mjs serve [--directory PATH] [--port 47821]\n  node bin/coop.mjs send --to ADDRESS --text MESSAGE [--client codex|claude]\n  node bin/coop.mjs send --to ADDRESS --file REPORT.txt [--client codex|claude]\n  node bin/coop.mjs context checkpoint --cycle ID --stage handoff|restored --receipt-token TOKEN --document PATH\n  node bin/coop.mjs mcp [--client codex|claude]\n\n会话查询与消息历史位于用户管理页面；MCP 提供 send_message 和 context_checkpoint。');
+    console.log('Cooperation\n\n  node bin/coop.mjs serve [--directory PATH] [--port 47821]\n  node bin/coop.mjs send --to ADDRESS --text MESSAGE [--client codex|claude]\n  node bin/coop.mjs send --to ADDRESS --file REPORT.txt [--client codex|claude]\n  node bin/coop.mjs session create --target-client opencode --directory PATH --request-id KEY [--title TITLE] [--client codex|claude]\n  node bin/coop.mjs session connect --to ADDRESS --directory PATH --request-id KEY [--client codex|claude]\n  node bin/coop.mjs context checkpoint --cycle ID --stage handoff|restored --receipt-token TOKEN --document PATH\n  node bin/coop.mjs mcp [--client codex|claude]\n\nMCP 提供 send_message、context_checkpoint、create_session、connect_session。生命周期操作的未知结果必须用原 requestId 核对。');
     if (command !== 'help' && command !== '--help') process.exitCode = 1;
   }
 } catch (error) { console.error(error.message); process.exitCode = 1; }

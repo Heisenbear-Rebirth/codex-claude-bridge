@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { join, posix, resolve, win32 } from 'node:path';
 import { createInterface } from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
+import { readAccessPolicy } from '../access-policy.mjs';
 
 const LIVE_STATUS_WARNING = 'Codex history metadata does not report whether a conversation is currently running; live status is unknown.';
 const USER_SESSION_SOURCES = new Set(['cli', 'vscode', 'exec', 'mcp', 'app', 'desktop']);
@@ -91,6 +92,7 @@ function toSession(row) {
 }
 
 async function readSessions({ codexHome, id } = {}) {
+  const policy = await readAccessPolicy();
   const warnings = [];
   let databases;
   try {
@@ -118,9 +120,10 @@ async function readSessions({ codexHome, id } = {}) {
       if (!columns.has('source')) warnings.push(`Codex history schema in ${entry.name} cannot identify user conversations; unverified rows are hidden.`);
       const selected = ['id', 'name', 'title', 'cwd', 'updated_at_ms', 'updated_at', 'created_at_ms', 'created_at', 'source', 'thread_source', 'agent_role', 'agent_path']
         .filter((column) => columns.has(column));
-      const statement = database.prepare(`SELECT ${selected.map((column) => `"${column}"`).join(', ')} FROM threads${id == null ? '' : ' WHERE id = ?'}`);
+      database.function('coop_directory_allowed', { deterministic: true }, cwd => policy.permits(plainDirectory(cwd || '')) ? 1 : 0);
+      const statement = database.prepare(`SELECT ${selected.map((column) => `"${column}"`).join(', ')} FROM threads WHERE coop_directory_allowed(cwd)=1${id == null ? '' : ' AND id = ?'}`);
       const rows = id == null ? statement.all() : statement.all(id);
-      return { sessions: rows.filter((row) => typeof row.id === 'string' && row.id && isUserSession(row)).map(toSession), warnings: [...warnings, LIVE_STATUS_WARNING] };
+      return { sessions: rows.filter((row) => policy.permits(plainDirectory(row.cwd || '')) && typeof row.id === 'string' && row.id && isUserSession(row)).map(toSession), warnings: [...warnings, LIVE_STATUS_WARNING] };
     } catch {
       warnings.push(`Codex history database ${entry.name} could not be read.`);
     } finally {
@@ -131,6 +134,7 @@ async function readSessions({ codexHome, id } = {}) {
 }
 
 export async function listCodexSessions({ directory, recursive = false, codexHome } = {}) {
+  if (directory != null) (await readAccessPolicy()).assert(directory, recursive);
   if (directory != null && (typeof directory !== 'string' || !directory.trim())) {
     throw adapterError('CODEX_INVALID_DIRECTORY', 'A non-empty directory is required.');
   }

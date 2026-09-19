@@ -38,11 +38,14 @@ let server, endpoint, pending, closing = false, writing = Promise.resolve(), las
 let controlPending = null, lastControl = null;
 const controlOperations = new Map();
 let registryTimer;
+const nativeUiInstanceId = /^[0-9a-f-]{36}$/.test(process.env.COOP_NATIVE_UI_INSTANCE_ID || '') ? process.env.COOP_NATIVE_UI_INSTANCE_ID : null;
+let nativeLifecycleOperationId = null;
 let visibilityHistory = { status: enabled && peerMessageVisibility && peerHistoryVisibility ? 'pending' : 'disabled', count: 0 };
 let historyRestoreSession = null;
 const auditFile = join(dataDirectory, 'compactions.jsonl');
 const audit = event => appendFile(auditFile, JSON.stringify({ at: new Date().toISOString(), instanceId, ...event }) + '\n', 'utf8');
 function publicState() { return { ...state.publicState(), wrapperPid: process.pid, childPid: child.pid, instanceId, cwd: process.cwd(),
+  nativeUiInstanceId, nativeLifecycleOperationId,
   protocolVersion: 2, connected: !closing && !state.inputEnded, observedAt: new Date().toISOString(),
   capabilities: { readActivity: true, interrupt: true, sendControl: true, compact: true, observeCompletion: true, passiveUsage: true,
     hardAutomation: false, peerMessageVisibility: enabled && peerMessageVisibility, peerHistoryVisibility: enabled && peerMessageVisibility && peerHistoryVisibility },
@@ -71,7 +74,14 @@ async function finishCompaction(status, extra = {}) {
   await audit({ type: 'finished', ...lastCompaction }).catch(() => {});
   operation.resolve(lastCompaction); persist();
 }
-const inputObserver = new JsonLineObserver(message => { state.host(message); persist(); });
+const inputObserver = new JsonLineObserver(message => {
+  if (nativeUiInstanceId && !nativeLifecycleOperationId && message.type === 'user') {
+    const content = message.message?.content;
+    const text = typeof content === 'string' ? content : Array.isArray(content) ? content.filter(p => p.type === 'text').map(p => p.text).join('\n') : '';
+    nativeLifecycleOperationId = /^\[Cooperation native session:([0-9a-f-]{36})\]\n/.exec(text)?.[1] || null;
+  }
+  state.host(message); persist();
+});
 const outputObserver = new JsonLineObserver(message => {
   state.child(message);
   if (message.parent_tool_use_id || (message.session_id && state.sessionId !== message.session_id.toLowerCase())) return;

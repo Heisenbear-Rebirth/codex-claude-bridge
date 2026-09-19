@@ -13,8 +13,9 @@ import { MaintenanceController } from './maintenance-controller.mjs';
 import { CheckpointService } from './checkpoint-service.mjs';
 import { readWrapperDirectories, wrapperEnabledFor, WrapperDirectorySettings } from './wrapper-directories.mjs';
 import { containsDirectory } from './directory-service.mjs';
+import { ProjectGroups } from './project-groups.mjs';
 
-export async function startServer({ root, port = 47821, host = '127.0.0.1', defaultDirectory = root, codexContext, adapters, bridgeProbe, runtimeFactory, startMonitoring = true, onShutdown = () => {} } = {}) {
+export async function startServer({ root, port = 47821, host = '127.0.0.1', defaultDirectory = root, codexContext, adapters, bridgeProbe, runtimeFactory, lifecycleDirectories, startMonitoring = true, onShutdown = () => {} } = {}) {
   if (host !== '127.0.0.1') throw new Error('管理台仅允许监听 127.0.0.1。');
   const dataDirectory = join(root, '.cooperation');
   await mkdir(dataDirectory, { recursive: true });
@@ -39,20 +40,21 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
   const publish = (event, data) => { for (const response of streams) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
   const codexBridge = !adapters ? await new CodexBridgeConnection({ root, context: codexContext, probe: bridgeProbe, onUpdate: state => publish('bridge', state) }).init() : null;
   const bridgeStatus = () => codexBridge?.status() || { connected: Boolean(codexContext?.pipePath && codexContext?.callerThreadId), state: 'unmanaged' };
-  const service = new CooperationService({ store, codexContext, codexBridge, adapters, onMessage: (id) => {
+  const service = new CooperationService({ store, root, codexContext, codexBridge, adapters, lifecycleDirectories, runtimeFactory, onMessage: (id) => {
     for (const response of streams) response.write(`event: message\ndata: ${JSON.stringify({ id })}\n\n`);
   } });
   const monitor = new ContextMonitor({ store, service, runtimeFactory, onUpdate: session => publish('management', { client: session.client, id: session.id }) });
   const controller = new MaintenanceController({ root, store, service, monitor, onUpdate: session => publish('management', { client: session.client, id: session.id }) });
   const checkpoints = new CheckpointService({ root, store, onReceipt: cycleId => publish('management', { cycleId }) });
   const wrapperSettings = new WrapperDirectorySettings(root);
+  const groups = new ProjectGroups(store);
   const directoryRecords = async () => { const config = await readWrapperDirectories(root); return store.directories().map(d => ({ ...d, claudeControlEnabled: wrapperEnabledFor(config, d.path) })); };
   const scope = ids => {
     if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string')) throw new Error('目录筛选格式不正确。');
     return store.directories().filter(d => ids.includes(d.id));
   };
   const resolveSession = async address => {
-    const target = parseAddress(address); const found = await service.adapters[target.client].find(target.id);
+    const target = parseAddress(address); const found = await service.adapters[target.client]?.find(target.id);
     if (!found) throw new Error('找不到指定的会话。'); return publicSession(found);
   };
   let actualPort = port;
@@ -82,6 +84,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
       }
       if (request.method === 'GET' && url.pathname === '/api/config') {
         return json(response, 200, { version: '0.2.0', installationDirectory: root, defaultDirectory, directories: await directoryRecords(), policyDefaults: POLICY_DEFAULTS, csrfToken,
+          lifecycle: service.lifecycle.capabilities(), lifecycleDirectories: service.lifecycle.directories,
           bridge: { codex: bridgeStatus().connected, codexStatus: bridgeStatus() }, warnings: store.warnings });
       }
       if (request.method === 'GET' && url.pathname === '/api/bridge') {
@@ -98,6 +101,19 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
         return json(response, 200, result);
       }
       if (request.method === 'GET' && url.pathname === '/api/directories') return json(response, 200, { directories: await directoryRecords() });
+      if (request.method === 'GET' && url.pathname === '/api/groups') return json(response, 200, { groups: groups.list() });
+      if (request.method === 'POST' && ['/api/groups', '/api/groups/remove'].includes(url.pathname)) {
+        if (!equal(request.headers['x-coop-ui'], csrfToken)) return json(response, 403, { error: '请从本地管理页面编辑分组。' });
+        const input = await body(request);
+        let group;
+        if (url.pathname.endsWith('/remove')) groups.remove(input);
+        else {
+          const discovered = await service.sessions({ directories: store.directories() });
+          group = groups.save(input, discovered.sessions);
+        }
+        publish('groups', { id: group?.id || input.id });
+        return json(response, 200, { group, groups: groups.list() });
+      }
       if (request.method === 'GET' && url.pathname === '/api/monitoring') {
         return json(response, 200, { sessions: store.db.prepare('SELECT data FROM snapshots').all().map(row => {
           const snapshot = JSON.parse(row.data); return { ...snapshot, policy: store.getPolicy(snapshot.session),
@@ -129,6 +145,10 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
             patch.enabled = patch.autoCompress; patch.mode = 'automatic'; delete patch.autoCompress;
           }
           const currentPolicy = store.getPolicy(session);
+          if (session.client === 'opencode' && patch.enabled === true) {
+            const runtime = await service.adapters.opencode.status(session.id);
+            if (runtime.capabilities?.automaticMaintenance !== true) throw new Error('OpenCode 维护能力尚未就绪，请在原生任务结束后重载插件并刷新状态。');
+          }
           if (input.expectedRevision !== undefined && input.expectedRevision !== (currentPolicy?.revision || 0))
             return json(response, 409, { error: '策略已在其他窗口更新，请刷新后重试。', policy: currentPolicy });
           const policy = store.savePolicy(session, patch); publish('management', { client: session.client, id: session.id });
@@ -158,10 +178,10 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
         if (url.searchParams.has('addresses')) {
           const input = JSON.parse(url.searchParams.get('addresses'));
           if (!Array.isArray(input) || input.length > 2000 || input.some(a => typeof a !== 'string')) throw new Error('会话筛选格式不正确。');
-          addresses = new Set(input.map(a => { const s = parseAddress(a); return s.client + ':' + s.id.toLowerCase(); }));
+          addresses = new Set(input.map(a => { const s = parseAddress(a); return s.client + ':' + (s.client === 'opencode' ? s.id : s.id.toLowerCase()); }));
         }
         const messages = (query.directories?.length === 0 ? [] : store.list(query)).filter(message => addresses === null ||
-          [message.from, message.to].some(s => addresses.has(s.client + ':' + s.id.toLowerCase())));
+          [message.from, message.to].some(s => addresses.has(s.client + ':' + (s.client === 'opencode' ? s.id : s.id.toLowerCase()))));
         return json(response, 200, { messages, total: messages.length });
       }
       if (request.method === 'GET' && url.pathname === '/api/events') {
@@ -173,12 +193,50 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
       }
       if (request.method === 'POST' && url.pathname === '/api/send') {
         if (!equal(request.headers.authorization, `Bearer ${token}`)) return json(response, 401, { error: '需要本机通信客户端凭据。' });
-        const result = await service.send(await body(request));
+        const input = await body(request);
+        if (parseAddress(`${input.from?.client}:${input.from?.id}`).client === 'opencode') throw new Error('OpenCode 发送方必须使用原生插件身份桥接。');
+        const result = await service.send(input);
         return json(response, 200, result);
+      }
+      if (request.method === 'POST' && url.pathname === '/api/opencode/send') {
+        if (!equal(request.headers.authorization, `Bearer ${token}`)) return json(response, 401, { error: '需要本机通信客户端凭据。' });
+        const adapter = service.adapters.opencode;
+        if (!adapter?.verifySender) throw new Error('OpenCode identity bridge unavailable.');
+        const input = await adapter.verifySender(await body(request));
+        if (input.action) throw new Error('原生凭据不属于发送操作。');
+        return json(response, 200, await service.send(input, { kind: 'opencode-tool-context', instanceId: input.instanceId,
+          sessionId: input.from.id, nativeMessageId: input.nativeMessageId, cwd: input.cwd }));
+      }
+      if (request.method === 'POST' && ['/api/lifecycle', '/api/ui/lifecycle', '/api/opencode/lifecycle'].includes(url.pathname)) {
+        const ui = url.pathname === '/api/ui/lifecycle';
+        if (ui ? !equal(request.headers['x-coop-ui'], csrfToken) : !equal(request.headers.authorization, `Bearer ${token}`)) return json(response, 403, { error: '会话操作需要本项目的有效身份。' });
+        let input = await body(request), origin;
+        if (url.pathname === '/api/opencode/lifecycle') {
+          input = await service.adapters.opencode.verifySender(input);
+          if (!['create','connect'].includes(input.action)) throw new Error('原生凭据不属于生命周期操作。');
+          origin = { kind: 'opencode-tool-context', from: input.from, nativeMessageId: input.nativeMessageId, instanceId: input.instanceId };
+        } else if (ui) {
+          if (Object.keys(input).some(k => !['action','args'].includes(k))) throw new Error('管理请求字段不正确。');
+          origin = { kind: 'management-ui' };
+        } else {
+          if (Object.keys(input).some(k => !['action','args','from'].includes(k))) throw new Error('工具请求字段不正确。');
+          const from = parseAddress(`${input.from?.client}:${input.from?.id}`);
+          if (from.client === 'opencode') throw new Error('OpenCode 必须使用原生 ToolContext 身份桥。');
+          origin = { kind: 'native-client', from };
+        }
+        return json(response, 200, await service.lifecycle.execute(input.action, input.args, origin));
       }
       if (request.method === 'POST' && url.pathname === '/api/checkpoint') {
         if (!equal(request.headers.authorization, `Bearer ${token}`)) return json(response, 401, { error: '需要本机通信客户端凭据。' });
         return json(response, 200, await checkpoints.accept(await body(request)));
+      }
+      if (request.method === 'POST' && url.pathname === '/api/opencode/checkpoint') {
+        if (!equal(request.headers.authorization, `Bearer ${token}`)) return json(response, 401, { error: '需要本项目的管理服务凭据。' });
+        const input = await service.adapters.opencode.verifySender(await body(request));
+        if (input.action !== 'checkpoint') throw new Error('原生凭据不属于维护回执。');
+        return json(response, 200, await checkpoints.accept({ ...input.args, from: input.from }, {
+          kind: 'opencode-tool-context', instanceId: input.instanceId, nativeMessageId: input.nativeMessageId, nativeUserMessageId: input.nativeUserMessageId,
+        }));
       }
       const assets = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui-state.mjs': ['ui-state.mjs', 'text/javascript'], '/styles.css': ['styles.css', 'text/css'] };
       if (request.method === 'GET' && assets[url.pathname]) {
@@ -187,7 +245,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
         response.end(await readFile(join(root, 'public', filename))); return;
       }
       json(response, 404, { error: '接口不存在。' });
-    } catch (error) { json(response, error.statusCode || 400, { error: error.message }); }
+    } catch (error) { json(response, error.statusCode || 400, { error: error.message, ...(error.notSubmitted === true ? { notSubmitted: true } : {}) }); }
   });
   try { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); }); }
   catch (error) { await controller.close(); await service.mailbox.close(); await codexBridge?.close(); store.close(); throw error; }
@@ -199,7 +257,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
   async function close() {
     if (closed) return closingPromise; closed = true;
     closingPromise = (async () => {
-    await controller.close(); await service.mailbox.close(); await codexBridge?.close();
+    await controller.close(); await service.lifecycle.close(); await service.mailbox.close(); await codexBridge?.close();
     for (const response of streams) response.end();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
