@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { JsonLineObserver, ClaudeProtocolState } from './claude-wrapper-state.mjs';
 import { NativeContextChannel } from './claude-context-channel.mjs';
 import { PeerMessageVisibility } from './claude-peer-visibility.mjs';
+import { claudeDisplayLabel } from './prompt-settings.mjs';
 import { loadPeerHistory } from './claude-peer-history.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -113,7 +114,7 @@ child.stdin.on('drain', () => process.stdin.resume());
 process.stdin.on('end', () => { state.inputEnded = true; child.stdin.end(); persist(); });
 process.stdin.on('error', () => child.stdin.end());
 child.stdin.on('error', () => { state.inputEnded = true; persist(); });
-const peerVisibility = new PeerMessageVisibility(() => state.sessionId);
+const peerVisibility = new PeerMessageVisibility(() => state.sessionId, 1024 * 1024, () => claudeDisplayLabel(root));
 function writeIdeOutput(chunk) { if (!process.stdout.write(chunk)) child.stdout.pause(); }
 function forwardOutput(chunk) {
   // Activity and maintenance observe original native messages, not display copies.

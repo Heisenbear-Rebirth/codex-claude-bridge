@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { JsonLineObserver, ClaudeProtocolState } from '../src/claude-wrapper-state.mjs';
+import { ClaudeRuntime } from '../src/runtime/claude-runtime.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = join(root, 'test', 'fixtures', 'claude-wrapper-child.mjs');
@@ -66,6 +67,24 @@ test('JSON observer preserves split Unicode and partial-line boundaries', () => 
   for (const byte of bytes) observer.push(Buffer.from([byte]));
   assert.deepEqual(seen, [{ text: '中文🙂"\\' }]); assert.equal(observer.atBoundary, true);
   observer.push(Buffer.from('{')); assert.equal(observer.atBoundary, false);
+});
+
+test('Claude runtime accepts controller operation options through the real wrapper for prompt, interrupt and compact', async t => {
+  const h = await harness(t), runtime = new ClaudeRuntime(h.id, { folder: join(h.directory, 'instances') });
+  const promptId = randomUUID(), interruptId = randomUUID(), compactId = randomUUID();
+  const initial = await runtime.status();
+  const prompt = await runtime.sendControl('hold', initial, { requestId: promptId });
+  assert.equal(prompt.status, 'submitted'); assert.equal(prompt.requestId, promptId);
+  const running = await until(async () => { const s = await runtime.status(); return s.activity === 'running' && s.activeTurnId === promptId ? s : null; }, 'runtime prompt running');
+  const interrupted = await runtime.interrupt(running, { requestId: interruptId });
+  assert.equal(interrupted.status, 'acknowledged'); assert.equal(interrupted.requestId, interruptId);
+  const idle = await until(async () => { const s = await runtime.status(); return s.activity === 'idle' && s.canCompact ? s : null; }, 'runtime interrupt completed');
+  const compacted = await runtime.compact(idle, { requestId: compactId });
+  assert.equal(compacted.status, 'completed'); assert.equal(compacted.requestId, compactId);
+  const frames = h.messages.filter(m => m.fixtureReceivedExactly);
+  assert.ok(frames.some(m => m.uuid === promptId && m.message.content === 'hold'));
+  assert.ok(frames.some(m => m.uuid === compactId && m.message.content === '/compact'));
+  assert.ok(frames.every(m => typeof m.uuid === 'string'));
 });
 test('pending permission and SDK control requests block compaction', () => {
   const state = new ClaudeProtocolState(randomUUID());

@@ -10,7 +10,7 @@ export async function detectSender({ client, metadata = {} } = {}) {
   if (typeof turn === 'string') { try { turn = JSON.parse(turn); } catch { turn = null; } }
   const codexId = metadata['openai/threadId'] || metadata['openai/thread_id'] || turn?.thread_id;
   const chosen = client || process.env.COOP_CLIENT || (codexId ? 'codex' : null);
-  if (chosen === 'opencode') throw new Error('OpenCode 请调用原生插件 cooperation_send_message；共享 CLI/MCP 不提供可验证的会话身份。');
+  if (chosen === 'opencode') throw new Error('OpenCode 请使用原生插件 cooperation_send_message 发送消息、cooperation_context_checkpoint 提交维护回执；共享 CLI/MCP 不提供可验证的会话身份。');
   if (chosen === 'codex' || (!chosen && process.env.CODEX_THREAD_ID && !process.env.CLAUDE_CODE_ENTRYPOINT)) {
     const id = codexId || process.env.CODEX_THREAD_ID;
     if (!id) throw new Error('当前进程没有 Codex 会话身份。');

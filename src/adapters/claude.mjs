@@ -290,8 +290,9 @@ export async function findClaudeSession(id, { configDir, directory } = {}) {
 function canonicalEndpoint(endpoint) {
   if (typeof endpoint !== 'string') throw fault('CLAUDE_INBOX_UNAVAILABLE', 'The Claude session has no peer inbox.');
   if (process.platform === 'win32') {
-    const match = /^\\\\\.\\pipe\\([a-zA-Z0-9_-]+)$/.exec(endpoint);
-    if (!match) throw fault('CLAUDE_INVALID_INBOX', 'Claude inbox is not a local named pipe.');
+    // Claude also publishes the Windows LOCAL namespace; other nesting stays forbidden.
+    const match = /^\\\\\.\\pipe\\((?:LOCAL\\)?[a-z0-9_-]+)$/i.exec(endpoint);
+    if (!match || match[0] !== endpoint) throw fault('CLAUDE_INVALID_INBOX', 'Claude inbox is not a local named pipe.');
     return `\\\\.\\pipe\\${match[1].toLowerCase()}`;
   }
   if (!path.isAbsolute(endpoint) || endpoint.includes('\0')) throw fault('CLAUDE_INVALID_INBOX', 'Claude inbox is not a local socket path.');

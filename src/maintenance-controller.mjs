@@ -10,6 +10,7 @@ import { maintenanceStage, restartCandidate, restartPlan, readRestartEvidence, c
 import { normalizeDirectory } from './directory-service.mjs';
 import { readAccessPolicy } from './access-policy.mjs';
 import { nativeMessageId } from './opencode-bridge.mjs';
+import { readPromptSettings } from './prompt-settings.mjs';
 
 const terminal = new Set(['completed', 'cancelled', 'needs_attention', 'user_intervened']);
 const active = s => ['running', 'waiting_permission', 'waiting_input'].includes(s.activity);
@@ -221,7 +222,7 @@ export class MaintenanceController {
     }
     if (cycle.session.client === 'opencode') {
       const expectedHead = cycle.state === 'compacting' && !cycle.compactDispatched ? cycle.controlTurnId
-        : cycle.state === 'restoring' && !cycle.controlDispatched ? cycle.compactResult?.nativeMessageId
+        : cycle.state === 'restoring' && !cycle.controlDispatched ? cycle.retryHeadId || cycle.compactResult?.nativeMessageId
         : cycle.state === 'writing_handoff' && !cycle.controlDispatched ? cycle.retryHeadId || cycle.originalTurnId || cycle.triggerRuntime.latestTurn?.id : null;
       if (expectedHead && state.latestTurn?.id !== expectedHead) return this.attention(cycle, '检测到维护以外的新原生输入，停止自动推进。', 'not_submitted');
     }
@@ -239,8 +240,9 @@ export class MaintenanceController {
       const tokens = this.store.getSetting('cycle-tokens:' + id);
       if (!tokens?.[stage]) return this.attention(cycle, '维护阶段凭证不可用。', 'not_submitted');
       const messageId = cycle.session.client === 'opencode' ? nativeMessageId() : null;
-      cycle = this.store.updateCycle(id, cycle.state, { controlDispatched: true, controlTurnId: messageId, controlRequestId: randomUUID(), recoveryBoundary: null, controlIntentAt: new Date().toISOString() });
-      const prompt = stage === 'handoff' ? handoffPrompt(this.root, cycle, tokens[stage]) : restorePrompt(this.root, cycle, tokens[stage]);
+      const prompts = await readPromptSettings(this.root);
+      cycle = this.store.updateCycle(id, cycle.state, { controlDispatched: true, controlTurnId: messageId, controlRequestId: randomUUID(), retryHeadId: null, recoveryBoundary: null, controlIntentAt: new Date().toISOString(), controlPromptRevision: prompts.revision });
+      const prompt = stage === 'handoff' ? handoffPrompt(this.root, cycle, tokens[stage], prompts.values) : restorePrompt(this.root, cycle, tokens[stage], prompts.values);
       const result = await adapter.sendControl(prompt, state, { requestId: cycle.controlRequestId, ...(messageId ? { messageId } : {}) });
       const current = this.store.cycle(id);
       this.store.updateCycle(id, current.state, { controlTurnId: result.activeTurnId || result.requestId || null, controlResult: result });
@@ -286,7 +288,8 @@ export class MaintenanceController {
       if (!endedControl) return;
       const restorePercent = sample.usage?.contextWindowTokens > 0 ? sample.usage.usedTokens * 100 / sample.usage.contextWindowTokens : null;
       this.store.updateCycle(id, cycle.state, { restoreUsage: sample.usage, restoreOverThreshold: restorePercent !== null && restorePercent >= cycle.policy.softPercent });
-      this.store.releaseCycle(id, { resumeText: cycle.wasWorkingAtTrigger ? continuePrompt(cycle) : null });
+      const resumeText = cycle.wasWorkingAtTrigger ? continuePrompt(cycle, (await readPromptSettings(this.root)).values) : null;
+      this.store.releaseCycle(id, { resumeText });
       this.store.setSetting('cycle-tokens:' + id, null);
       await this.service.mailbox?.drain(sessionKey(cycle.session)); this.onUpdate(cycle.session);
     }

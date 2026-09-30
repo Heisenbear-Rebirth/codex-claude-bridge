@@ -14,6 +14,9 @@ import { CheckpointService } from './checkpoint-service.mjs';
 import { readWrapperDirectories, wrapperEnabledFor, WrapperDirectorySettings } from './wrapper-directories.mjs';
 import { containsDirectory } from './directory-service.mjs';
 import { ProjectGroups } from './project-groups.mjs';
+import { PromptSettings } from './prompt-settings.mjs';
+import { defaultPromptValues } from '../public/prompt-templates.mjs';
+import { promptPreviewSamples } from './maintenance-prompts.mjs';
 
 export async function startServer({ root, port = 47821, host = '127.0.0.1', defaultDirectory = root, codexContext, adapters, bridgeProbe, runtimeFactory, lifecycleDirectories, startMonitoring = true, onShutdown = () => {} } = {}) {
   if (host !== '127.0.0.1') throw new Error('管理台仅允许监听 127.0.0.1。');
@@ -48,6 +51,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
   const checkpoints = new CheckpointService({ root, store, onReceipt: cycleId => publish('management', { cycleId }) });
   const wrapperSettings = new WrapperDirectorySettings(root);
   const groups = new ProjectGroups(store);
+  const prompts = new PromptSettings(root);
   const directoryRecords = async () => { const config = await readWrapperDirectories(root); return store.directories().map(d => ({ ...d, claudeControlEnabled: wrapperEnabledFor(config, d.path) })); };
   const scope = ids => {
     if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string')) throw new Error('目录筛选格式不正确。');
@@ -90,6 +94,17 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
       if (request.method === 'GET' && url.pathname === '/api/bridge') {
         if (url.searchParams.get('refresh') === '1') await codexBridge?.refresh();
         return json(response, 200, bridgeStatus());
+      }
+      if (url.pathname === '/api/prompt-settings') {
+        if (request.method === 'GET') return json(response, 200, { ...await prompts.read(), defaults: defaultPromptValues(), samples: promptPreviewSamples(root) });
+        if (request.method !== 'POST') return json(response, 405, { error: 'Method not allowed' });
+        if (!equal(request.headers['x-coop-ui'], csrfToken)) return json(response, 403, { error: '请从本地管理页面修改提示词。' });
+        const input = await body(request);
+        if (Object.keys(input).some(k => !['values', 'expectedRevision'].includes(k))) throw Error('不支持的提示词设置字段。');
+        const saved = await prompts.save(input.values, input.expectedRevision);
+        store.event('prompt_settings_saved', { revision: saved.revision });
+        publish('prompt-settings', { revision: saved.revision });
+        return json(response, 200, saved);
       }
       if (request.method === 'POST' && url.pathname === '/api/sessions') {
         if (!equal(request.headers['x-coop-ui'], csrfToken)) return json(response, 403, { error: '请从本地管理页面查询会话。' });
@@ -238,7 +253,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
           kind: 'opencode-tool-context', instanceId: input.instanceId, nativeMessageId: input.nativeMessageId, nativeUserMessageId: input.nativeUserMessageId,
         }));
       }
-      const assets = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui-state.mjs': ['ui-state.mjs', 'text/javascript'], '/styles.css': ['styles.css', 'text/css'] };
+      const assets = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui-state.mjs': ['ui-state.mjs', 'text/javascript'], '/prompt-editor.mjs': ['prompt-editor.mjs', 'text/javascript'], '/prompt-templates.mjs': ['prompt-templates.mjs', 'text/javascript'], '/styles.css': ['styles.css', 'text/css'] };
       if (request.method === 'GET' && assets[url.pathname]) {
         const [filename, type] = assets[url.pathname];
         response.writeHead(200, { 'Content-Type': `${type}; charset=utf-8` });
@@ -257,7 +272,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
   async function close() {
     if (closed) return closingPromise; closed = true;
     closingPromise = (async () => {
-    await controller.close(); await service.lifecycle.close(); await service.mailbox.close(); await codexBridge?.close();
+    await controller.close(); await service.lifecycle.close(); await service.mailbox.close(); await codexBridge?.close(); await prompts.close();
     for (const response of streams) response.end();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));

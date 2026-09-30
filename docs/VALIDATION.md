@@ -1,5 +1,23 @@
 # Validation and supported scope
 
+## Custom message and maintenance prompts (2026-09-30)
+
+The complete suite passes **189 tests**. Project-local prompt settings are revisioned and atomically saved through a CSRF-protected UI endpoint. Tests verify bounded templates, mandatory runtime checkpoint insertion, restart persistence, stale-write rejection, queued-message affix snapshots, per-stage maintenance customization, OpenCode dynamic affixes and duplicate-delivery handling, and Claude presentation-only labels.
+
+An isolated Chrome session verified all six editor categories, actual save/reload, example-only previews, empty affixes, per-category and full default restoration, stale-save drafts, keyboard closing, desktop and 390px mobile layouts, and zero page errors. It posted only to fixture discovery and prompt-settings endpoints. Browser profile, caches and temporary files stayed in the project.
+
+A real isolated OpenCode 1.18.30 backend with a local deterministic model completed soft/hard cycles using customized handoff, restore and continuation templates, plus ordinary peer prefixes/suffixes. Both cycles retained one compaction, two accepted native checkpoints and the nondefault variant. No production business session was prompted for this feature. The production manager was gracefully reloaded at its existing URL when no active maintenance or queued deliveries required it. Native clients were left running; cached native plugin/wrapper code takes this feature on its next normal restart. See [usage and evidence](PROMPT-SETTINGS.md).
+
+## OpenCode maintenance repair (2026-09-30)
+
+The complete suite passes **184 tests**, with zero failures, skips or cancellations. The repair prevents the OpenCode MCP catalog from shadowing native plugin tools, binds explicit restore retries to the verified current input, and preserves the saved model/agent/variant on ordinary peer delivery. Regression coverage includes newer-input rejection and keeping FIFO locked until a valid restored receipt.
+
+The user-designated OpenCode **1.18.33** session completed soft and hard maintenance with the configured external model. Native records confirm one compaction and two accepted checkpoints per cycle, identical handoff/restored document hashes, FIFO A/B delivery and individual replies, and exactly one continuation following the hard cycle's confirmed abort. The soft run required recovery after the original MCP collision and an empty native restore response; its summary was also empty. Those anomalies remain recorded. The hard run produced a nonempty summary and completed automatically. No missing receipt was synthesized and neither cycle repeated compaction.
+
+After plugin reload and a native user turn persisted `max`, two further real peer messages retained the model, agent, variant and permissions. The OpenCode native send tool returned a callback to the initiating Codex chat; the callback was actually received and matched its `opencode-tool-context` audit identity. Final target state: idle, no active cycle, FIFO empty, `max` retained, and automatic maintenance restored to its original off state with 50/80 thresholds. Evidence: `final-live.json`.
+
+An isolated real **1.18.30** backend with a deterministic model also passed soft/hard cycles while the native plugin and a same-named Cooperation MCP were both enabled. Two subsequent peer deliveries retained a nondefault variant. Reports and test log: `.cooperation/verification/opencode-repair-20260930/`. The manager was gracefully reloaded at the same local URL after other active maintenance finished; the user reloaded OpenCode. Existing UI work and unrelated local changes were preserved. See [the repair details](OPENCODE-MAINTENANCE.md).
+
 ## Publication checks
 
 The release passes **168 automated tests**. Personal paths and native session identifiers in documentation use generic examples. Local OpenCode configuration, runtime evidence, credentials, dependencies and build outputs are excluded from version control. The tracked `session-lifecycle-cancelled.json` preserves the discontinued lifecycle state in fresh checkouts; regression coverage verifies that no private runtime marker is needed.

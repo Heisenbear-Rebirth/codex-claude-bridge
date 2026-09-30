@@ -1,9 +1,8 @@
 // Presentation only: these bytes go to the IDE, never back to Claude.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ENVELOPE = /^发送方：(codex|claude|opencode):\/\/[^\r\n]+:([a-zA-Z0-9_-]{8,128})\r?\n发送方地址：(codex|claude|opencode):([a-zA-Z0-9_-]{8,128})\r?\n消息编号：([0-9a-f-]{36})\r?\n\r?\n/gm;
-const LABEL = '【Cooperation 会话消息】\n';
 
-export function visiblePeerMessage(message, sessionId) {
+export function visiblePeerMessage(message, sessionId, label = '【Cooperation 会话消息】') {
   if (!UUID.test(sessionId || '') || message?.session_id?.toLowerCase?.() !== sessionId.toLowerCase()
     || message.type !== 'user' || message.isReplay !== true || message.parent_tool_use_id != null
     || message.origin?.kind !== 'peer' || !UUID.test(message.uuid || '') || message.message?.role !== 'user') return message;
@@ -15,15 +14,18 @@ export function visiblePeerMessage(message, sessionId) {
   if (matches.length !== 1) return message;
   const [, client, sender, addressClient, addressId, id] = matches[0];
   if (client !== addressClient || sender !== addressId || id.toLowerCase() !== message.uuid.toLowerCase()) return message;
-  const labelled = text.startsWith(LABEL);
-  const visible = labelled ? content : typeof content === 'string' ? LABEL + content
-    : content.map((block, index) => index === 0 ? { ...block, text: LABEL + block.text } : block);
+  const selected = typeof label === 'function' ? label() : label;
+  const prefix = selected ? selected + '\n' : '';
+  const labelled = prefix && text.startsWith(prefix);
+  const visible = labelled ? content : typeof content === 'string' ? prefix + content
+    : content.map((block, index) => index === 0 ? { ...block, text: prefix + block.text } : block);
   return { ...message, isSynthetic: false, message: { ...message.message, content: visible } };
 }
 
 // Bounded line framing. Malformed, oversized and incomplete frames pass unchanged.
 export class PeerMessageVisibility {
-  constructor(sessionId, maximum = 1024 * 1024) {
+  constructor(sessionId, maximum = 1024 * 1024, label = '【Cooperation 会话消息】') {
+    this.label = label;
     this.sessionId = sessionId; this.maximum = maximum; this.parts = []; this.size = 0; this.passthrough = false; this.seen = new Set(); this.history = [];
   }
   push(chunk, forward) {
@@ -42,7 +44,7 @@ export class PeerMessageVisibility {
         let output = line;
         try {
           const original = JSON.parse(line.toString('utf8'));
-          const projected = visiblePeerMessage(original, this.sessionId());
+          const projected = visiblePeerMessage(original, this.sessionId(), this.label);
           if (projected !== original) {
             output = this.firstDisplay(projected)
               ? Buffer.from(JSON.stringify(projected) + (line.at(-2) === 13 ? '\r\n' : '\n')) : null;
@@ -61,7 +63,7 @@ export class PeerMessageVisibility {
   }
   restoreHistory(frames, forward) {
     this.history = frames.flatMap(frame => {
-      const projected = visiblePeerMessage(frame, this.sessionId());
+      const projected = visiblePeerMessage(frame, this.sessionId(), this.label);
       return projected !== frame ? [projected] : [];
     });
     this.flushHistory(forward);

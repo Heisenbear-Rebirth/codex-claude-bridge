@@ -78,7 +78,7 @@ opencode://会话标题:ses_ExampleSessionID
 
 OpenCode 使用原生插件工具 `cooperation_send_message`，参数为用户给定或获准创建操作返回的 `to` 和正文 `message`。发送方 sessionID、messageID 和目录来自原生 `ToolContext`；插件请求原生工具权限，并生成仅在本次执行期间有效、消费一次的身份凭据。manager 从对应插件实例读取凭据绑定的原始参数，再进入普通消息 FIFO。审计保存 `source.kind=opencode-tool-context` 及来源原生消息 ID。新增 `cooperation_create_session` / `cooperation_connect_session` 使用相同来源核验，并独立持久化生命周期意图。
 
-Codex、Claude 可沿用现有 CLI/MCP 向 `opencode:` 地址发送。共享 CLI/MCP 无法确定具体 OpenCode 调用会话，因此 OpenCode 自身必须使用插件；不接受模型填写发送者 ID。维护使用新增的原生插件工具 `cooperation_context_checkpoint`，绑定assistant及其父控制消息，不能经通用CLI伪造来源。
+Codex、Claude 可沿用现有 CLI/MCP 向 `opencode:` 地址发送。OpenCode 自身只需加载原生插件；不要另加同名 `cooperation` MCP。若已有 `--client opencode` MCP 配置，新版会返回空工具列表，避免 MCP 的 `cooperation_` 前缀覆盖原生发送与回执工具；升级后重新连接该 MCP 或重开所属 OpenCode 后端，使旧进程重新加载代码。共享 CLI/MCP 无法确定具体 OpenCode 调用会话，因此 OpenCode 自身必须使用插件；不接受模型填写发送者 ID。维护使用新增的原生插件工具 `cooperation_context_checkpoint`，绑定assistant及其父控制消息，不能经通用CLI伪造来源。
 
 ## 投递证据与恢复
 

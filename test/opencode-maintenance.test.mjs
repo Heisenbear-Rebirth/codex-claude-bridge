@@ -109,6 +109,49 @@ test('OpenCode refuses forged checkpoint provenance and receipts from another na
   assert.equal(f.counts().compactions, 0);
 });
 
+test('OpenCode explicit document retries bind the current native head without repeating compaction or releasing FIFO early', async t => {
+  const f = await fixture(t), c = await f.begin();
+  // First handoff ended without a receipt, just like a shadowed MCP tool.
+  f.finish(); await f.advanceTo(c.id, 'needs_attention');
+  await f.manager.controller.retry(c.id);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.manager.store.cycle(c.id).retryHeadId, null);
+  await f.receipt(c.id, 'handoff'); f.finish(); await f.advanceTo(c.id, 'restoring');
+  await f.manager.controller.advance(c.id);
+  assert.equal(f.calls.length, 3);
+  const queued = await f.manager.service.mailbox.send({ id: randomUUID(), createdAt: new Date().toISOString(), from: { ...f.target, client: 'codex' }, to: f.target, text: 'after restored receipt' });
+  assert.equal(queued.status, 'queued');
+  // A provider can end the restore turn after reading, but before checkpointing.
+  f.finish(); await f.advanceTo(c.id, 'needs_attention');
+  await f.manager.controller.retry(c.id);
+  assert.equal(f.manager.store.cycle(c.id).state, 'restoring');
+  assert.equal(f.calls.length, 4);
+  assert.equal(f.counts().compactions, 1);
+  assert.equal(f.manager.store.getMessage(queued.id).status, 'queued');
+  await f.receipt(c.id, 'restored'); f.finish(); await f.advanceTo(c.id, 'completed');
+  assert.equal(f.counts().compactions, 1);
+  assert.equal(f.calls.length, 5);
+  assert.match(f.calls.at(-1).parts[0].text, /after restored receipt/);
+});
+
+test('OpenCode restore retry still refuses a native input arriving after the explicit retry snapshot', async t => {
+  const f = await fixture(t), c = await f.begin();
+  await f.receipt(c.id, 'handoff'); f.finish(); await f.advanceTo(c.id, 'restoring');
+  await f.manager.controller.advance(c.id); f.finish(); await f.advanceTo(c.id, 'needs_attention');
+  const runtime = f.manager.monitor.runtime(f.target), original = runtime.status.bind(runtime);
+  let once = true;
+  runtime.status = async () => {
+    const snapshot = await original();
+    if (once) { once = false; f.assistant(f.user()); f.finish(); }
+    return snapshot;
+  };
+  await f.manager.controller.retry(c.id);
+  assert.equal(f.manager.store.cycle(c.id).state, 'needs_attention');
+  assert.match(f.manager.store.cycle(c.id).reason, /新原生输入/);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.counts().compactions, 1);
+});
+
 test('OpenCode successful HTTP compaction with a native summary error never restores or repeats', async t => {
   const f = await fixture(t); f.fail(); const c = await f.begin();
   await f.receipt(c.id, 'handoff'); f.finish(); await f.advanceTo(c.id, 'needs_attention');

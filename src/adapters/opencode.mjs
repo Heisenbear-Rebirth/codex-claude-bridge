@@ -87,11 +87,11 @@ export function createOpenCodeAdapter({ root = installationRoot, timeout = 15000
       const selected = await target(id); if (!selected) throw new Error('OpenCode backend unavailable.');
       return rpc(selected.record, { action: 'status', targetId: id });
     },
-    async send({ targetId, text, messageId, targetSession }) {
+    async send({ targetId, text, messageId, targetSession, messageAffixes }) {
       const selected = await target(targetId, targetSession?.cwd); if (!selected) throw new Error('OpenCode backend unavailable.');
       const current = await rpc(selected.record, { action: 'status', targetId, includeUsage: false });
       if (current.capabilities?.sendMessage !== true) return { status: 'failed', transport: 'opencode-plugin', error: 'OpenCode 原生 user 消息接收尚未显式开启。' };
-      try { return await rpc(selected.record, { action: 'send', targetId, text, messageId, cwd: targetSession?.cwd || selected.session.cwd }); }
+      try { return await rpc(selected.record, { action: 'send', targetId, text, messageId, messageAffixes, cwd: targetSession?.cwd || selected.session.cwd }); }
       catch { return { status: 'unknown', transport: 'opencode-plugin', error: 'OpenCode 投递未确认，请核对原生记录，不要自动重发。' }; }
     },
     async verifySender({ instanceId, proof }) {

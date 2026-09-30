@@ -15,6 +15,8 @@ import { validatePolicy, evaluatePolicy } from '../src/context-policy.mjs';
 import { contextSourcePath } from '../src/context-usage.mjs';
 import { detectSender } from '../src/identity.mjs';
 import { visiblePeerMessage } from '../src/claude-peer-visibility.mjs';
+import { PromptSettings } from '../src/prompt-settings.mjs';
+import { defaultPromptValues } from '../public/prompt-templates.mjs';
 import { addressOf, visibleAddresses, connectionGuidance, openCodeContextState } from '../public/ui-state.mjs';
 
 async function fixture(t, options = {}) {
@@ -100,6 +102,48 @@ test('OpenCode uncertain sends retain their native ID across plugin restart and 
   assert.equal(second.nativeMessageId, first.nativeMessageId); assert.equal(second.nativeRecorded, true);
   assert.equal(second.status, 'unknown'); assert.equal(f.calls.length, 1);
   const conflict = await f.adapter.send({ ...input, text: 'different content' }); assert.equal(conflict.status, 'unknown'); assert.equal(f.calls.length, 1);
+});
+
+test('OpenCode applies saved or enqueue-time affixes once, including an empty prefix, without reloading the plugin', async t => {
+  const f = await fixture(t), settings = new PromptSettings(f.root), values = defaultPromptValues(), targetId = f.sessions[1].id;
+  values.messages.opencode = { prefix: 'custom prefix', suffix: 'custom suffix' }; await settings.save(values, 0);
+  const firstInput = { targetId, text: 'original', messageId: randomUUID() };
+  await f.adapter.send(firstInput);
+  assert.equal(f.calls[0].body.parts[0].text, 'custom prefix\n\noriginal\n\ncustom suffix');
+  values.messages.opencode = { prefix: 'later prefix', suffix: '' }; await settings.save(values, 1);
+  assert.equal((await f.adapter.send(firstInput)).duplicate, true);
+  assert.equal(f.calls.length, 1);
+  await f.adapter.send({ targetId, text: 'queued', messageId: randomUUID(), messageAffixes: { prefix: '', suffix: 'frozen suffix' } });
+  assert.equal(f.calls[1].body.parts[0].text, 'queued\n\nfrozen suffix');
+  await f.adapter.send({ targetId, text: 'latest', messageId: randomUUID() });
+  assert.equal(f.calls[2].body.parts[0].text, 'later prefix\n\nlatest');
+});
+
+test('OpenCode peer delivery preserves the selected model, agent and variant across consecutive messages', async t => {
+  const f = await fixture(t), session = f.sessions[1];
+  session.model = { providerID: 'selected', id: 'working-model', variant: 'max' }; session.agent = 'plan';
+  const original = f.client.session.promptAsync;
+  f.client.session.promptAsync = async input => {
+    // Match the native behavior: omitted variant is not inherited.
+    session.model = { providerID: input.body.model?.providerID, id: input.body.model?.modelID, variant: input.body.variant };
+    session.agent = input.body.agent;
+    return original(input);
+  };
+  for (const text of ['first queued message', 'second queued message']) {
+    assert.equal((await f.adapter.send({ targetId: session.id, text, messageId: randomUUID() })).status, 'submitted');
+    assert.deepEqual(session.model, { providerID: 'selected', id: 'working-model', variant: 'max' });
+    assert.equal(session.agent, 'plan');
+  }
+  for (const call of f.calls) { assert.equal(call.body.variant, 'max'); assert.equal(call.body.tools, undefined); }
+});
+
+test('OpenCode peer delivery inherits the last native user selection on older sessions without persisted settings', async t => {
+  const f = await fixture(t), target = f.sessions[1], nativeId = nativeMessageId();
+  f.messages.set(nativeId, { info: { id: nativeId, sessionID: target.id, role: 'user', time: { created: Date.now() },
+    agent: 'build', model: { providerID: 'selected', modelID: 'working-model', variant: 'high' } }, parts: [] });
+  await f.adapter.send({ targetId: target.id, text: 'keep the selection', messageId: randomUUID() });
+  assert.deepEqual(f.calls[0].body.model, { providerID: 'selected', modelID: 'working-model' });
+  assert.equal(f.calls[0].body.agent, 'build'); assert.equal(f.calls[0].body.variant, 'high');
 });
 
 test('OpenCode rejects default receive policy, moved directories and duplicate native backends', async t => {

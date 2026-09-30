@@ -5,6 +5,14 @@ import { join } from 'node:path';
 import { sendClaudeMessage } from '../adapters/claude.mjs';
 import { readAccessPolicy } from '../access-policy.mjs';
 
+// Controllers pass operation options; older callers pass the UUID directly.
+function controlRequestId(options) {
+  const id = typeof options === 'string' ? options : options?.requestId;
+  if (id === undefined) return randomUUID();
+  if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id)) throw new Error('Invalid Claude control request ID.');
+  return id;
+}
+
 export class ClaudeRuntime {
   constructor(sessionId, { folder = fileURLToPath(new URL('../../.cooperation/claude-wrapper/instances/', import.meta.url)) } = {}) {
     if (!/^[0-9a-f-]{36}$/i.test(sessionId)) throw new Error('Invalid Claude session ID.');
@@ -73,12 +81,13 @@ export class ClaudeRuntime {
       ? { detail: '本次使用普通 peer 通道；接收端尚未启用可见消息，请在工作结束后重新打开已接入的 Claude 面板。' } : {}) };
   }
   sendPeer(args) { return sendClaudeMessage(args); }
-  async sendControl(text, expected, requestId) { return this.sendMessage(text, { kind: 'maintenance', expected, requestId }); }
-  async interrupt(expected, requestId) { return this.control('interrupt', expected, { requestId }); }
-  async compact(expected) {
+  async sendControl(text, expected, options) { return this.sendMessage(text, { kind: 'maintenance', expected, requestId: controlRequestId(options) }); }
+  async interrupt(expected, options) { return this.control('interrupt', expected, { requestId: controlRequestId(options) }); }
+  async compact(expected, options) {
+    const requestId = controlRequestId(options);
     const current = await this.status();
     if (current.activity !== 'idle' || !current.canCompact || (expected && (current.instanceId !== expected.instanceId || current.activityRevision !== expected.activityRevision))) return { status: 'state_conflict' };
-    return this.request('/compact', { sessionId: this.id, instanceId: current.instanceId, requestId: randomUUID() });
+    return this.request('/compact', { sessionId: this.id, instanceId: current.instanceId, requestId });
   }
   close() {}
 }

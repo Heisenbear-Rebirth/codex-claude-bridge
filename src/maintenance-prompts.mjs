@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { PROMPT_DEFAULTS, renderPromptTemplate } from '../public/prompt-templates.mjs';
 
 function receiptInstruction(root, cycle, stage, token) {
   const args = { cycleId: cycle.id, stage, receiptToken: token, documentPath: cycle.handoffPath };
@@ -10,12 +11,21 @@ function receiptInstruction(root, cycle, stage, token) {
     '--cycle', quote(cycle.id), '--stage', stage, '--receipt-token', quote(token), '--document', quote(cycle.handoffPath.replaceAll('\\', '/'))].join(' ');
   return `完成后调用 context_checkpoint：${JSON.stringify(args)}\n若无此工具，执行以下命令（${cycle.session.client === 'codex' ? 'PowerShell' : 'Bash'}）：\n${command}\n收到 status=accepted 后结束本轮，等待后续指令。`;
 }
-export function handoffPrompt(root, cycle, token) {
-  return `即将压缩上下文，之后会读取交付文档来恢复上下文。请将接续任务所必需的信息保存到下方 documentPath，比如当前进展、关键约束或容易遗漏的事项。内容和组织方式自行判断。\n\n${receiptInstruction(root, cycle, 'handoff', token)}`;
+function render(stage, root, cycle, token, values = PROMPT_DEFAULTS) {
+  return renderPromptTemplate(values.maintenance[stage], { documentPath: cycle.handoffPath, cycleId: cycle.id,
+    sessionId: cycle.session.id, client: cycle.session.client,
+    checkpoint: stage === 'continue' ? '' : receiptInstruction(root, cycle, stage === 'handoff' ? 'handoff' : 'restored', token) });
 }
-export function restorePrompt(root, cycle, token) {
-  return `请读取下方 documentPath 中的交付文档，按需查阅其他文件，恢复到能够接续任务的状态。\n\n${receiptInstruction(root, cycle, 'restored', token)}`;
+export function handoffPrompt(root, cycle, token, values) { return render('handoff', root, cycle, token, values); }
+export function restorePrompt(root, cycle, token, values) { return render('restore', root, cycle, token, values); }
+export function continuePrompt(cycle, values) {
+  return render('continue', '', cycle || { session: {}, id: '', handoffPath: '' }, '', values);
 }
-export function continuePrompt() {
-  return '上下文维护已完成，继续工作。';
+export function promptPreviewSamples(root) {
+  return Object.fromEntries(['codex', 'claude', 'opencode'].map(client => {
+    const cycle = { id: '示例流程', session: { id: '示例会话', client }, handoffPath: join(root, '.cooperation', 'handoffs', client, '示例会话', '示例流程.md') };
+    return [client, { documentPath: cycle.handoffPath, cycleId: cycle.id, sessionId: cycle.session.id, client,
+      handoffCheckpoint: receiptInstruction(root, cycle, 'handoff', '<运行时生成的阶段凭证>'),
+      restoreCheckpoint: receiptInstruction(root, cycle, 'restored', '<运行时生成的阶段凭证>') }];
+  }));
 }

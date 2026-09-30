@@ -21,6 +21,13 @@ test('unified maintenance sender requires idle and uses the original expected-st
   const expected = { activity: 'idle', instanceId: 'native-instance', activityRevision: 3 };
   await r.sendControl('handoff', expected, requestId);
   assert.deepEqual(calls, [['prompt', expected, { text: 'handoff', requestId }]]);
+  await r.sendControl('restore', expected, { requestId });
+  assert.deepEqual(calls[1], ['prompt', expected, { text: 'restore', requestId }]);
+  await r.interrupt(expected, requestId);
+  await r.interrupt(expected, { requestId });
+  assert.deepEqual(calls.slice(2), [['interrupt', expected, { requestId }], ['interrupt', expected, { requestId }]]);
+  await assert.rejects(r.sendControl('invalid', expected, { requestId: { requestId } }), /Invalid Claude control request ID/);
+  assert.equal(calls.length, 4);
 });
 test('old or disconnected visibility support is reported, never retried or upgraded to a user prompt', async () => {
   const r = new ClaudeRuntime(randomUUID()); let count = 0;

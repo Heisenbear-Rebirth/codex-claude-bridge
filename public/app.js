@@ -1,3 +1,4 @@
+import { setupPromptEditor } from './prompt-editor.mjs';
 import { addressOf, clientName, autoCompressEnabled, projectMembers, workspaceAddresses, messageMatches, validThresholds, PolicySaver, directoryConnection, connectionGuidance, sessionConnected, openCodeContextState } from './ui-state.mjs';
 const $ = id => document.getElementById(id);
 const state = { config: null, bridge: null, online: true, mode: 'directories', directories: [], groups: [], sessions: [],
@@ -272,9 +273,10 @@ async function loadSessions(force=false){
     await loadMonitoring();setError('global-error',result.warnings?.join(' · ')||'');
   }catch(error){state.discoveryError=error.message;setError('global-error','发现会话失败：'+error.message);renderNavigation();}finally{state.discoveryBusy=false;}
 }
-async function loadMonitoring(){if(state.closed)return;try{const result=await request('/api/monitoring');for(const sample of result.sessions){const s=state.sessions.find(s=>addressOf(s)===addressOf(sample.session));if(!s)continue;if((sample.policy?.revision||0)<(s.policy?.revision||0))sample.policy=s.policy;Object.assign(s,{monitoring:sample,policy:sample.policy,cycle:sample.cycle,lastCycle:sample.lastCycle,queueCount:sample.queueCount,queueState:sample.queueState});const value=state.editors.get(addressOf(s));if(value&&!value.editing&&!value.saver.running&&value.status!=='error'){value.draft=effective(s);value.saver.revision=s.policy?.revision||0;}}
+let monitoringBusy=false;
+async function loadMonitoring(){if(state.closed||monitoringBusy)return;monitoringBusy=true;try{const result=await request('/api/monitoring',{signal:AbortSignal.timeout(8000)});if(state.closed)return;setServiceOnline(true);for(const sample of result.sessions){const s=state.sessions.find(s=>addressOf(s)===addressOf(sample.session));if(!s)continue;if((sample.policy?.revision||0)<(s.policy?.revision||0))sample.policy=s.policy;Object.assign(s,{monitoring:sample,policy:sample.policy,cycle:sample.cycle,lastCycle:sample.lastCycle,queueCount:sample.queueCount,queueState:sample.queueState});const value=state.editors.get(addressOf(s));if(value&&!value.editing&&!value.saver.running&&value.status!=='error'){value.draft=effective(s);value.saver.revision=s.policy?.revision||0;}}
     refreshCards();const navSig=JSON.stringify(state.sessions.map(s=>[addressOf(s),activity(s),connected(s)]));if(navSig!==state.navSig){state.navSig=navSig;renderNavigation();updateScope();}if(!state.selectedAddress)renderProjectOverview();if(state.connectionHelp)renderConnectionHelp();
-  }catch{/* SSE reports connection loss. */}}
+  }catch{void checkServiceHealth();}finally{monitoringBusy=false;}}
 function statusBadge(status){return el('span','delivery-badge '+status,delivery[status]||'待确认');}
 function routePart(s,direction){const row=el('div','message-route');row.append(el('span','route-direction',direction),el('strong','',name(s)),el('span','route-client',clientName(s.client)));row.title=label(s);return row;}
 function renderDetail(message){const panel=$('message-detail'),scroll=panel.dataset.messageId===message?.id?panel.scrollTop:0;panel.dataset.messageId=message?.id||'';panel.replaceChildren();$('messages-panel').classList.toggle('detail-open',Boolean(message));if(!message){const empty=el('div','detail-empty');empty.append(el('span','detail-symbol','↗'),el('h3','','选择一条通信'),el('p','','在这里阅读完整消息。'));panel.append(empty);return;}
@@ -297,7 +299,22 @@ function renderConnectionHelp(){const c=state.connectionHelp;if(!c)return;const 
   for(const step of guide.steps){const li=el('li'),content=el('div','connection-step');content.append(el('h3','',step.title),el('p','',step.text));if(step.code)content.append(el('pre','connection-code',step.code),button(step.copyLabel||'复制','text-button',()=>copy(step.code)));li.append(content);$('connection-help-steps').append(li);}$('connection-help-note').textContent=guide.note||'';
 }
 function renderBridge(status){state.bridge=status;const display=directoryConnection({client:'codex',bridge:status,online:state.online});$('codex-connection').textContent='Codex '+display.label;$('codex-connection').className='bridge-status '+display.tone;renderNavigation();updateScope();if(state.connectionHelp)renderConnectionHelp();}
-async function loadBridge(force=false){try{renderBridge(await request('/api/bridge'+(force?'?refresh=1':'')));}catch{renderBridge({connected:false});}}
+async function loadBridge(force=false){try{const bridge=await request('/api/bridge'+(force?'?refresh=1':''),{signal:AbortSignal.timeout(12000)});if(state.closed)return;setServiceOnline(true);renderBridge(bridge);}catch{void checkServiceHealth();}}
+let eventStreamOnline=false,healthBusy=false,serviceSuccessRevision=0;
+function setServiceOnline(online){
+  if(state.closed)return;
+  if(online)serviceSuccessRevision++;
+  const changed=state.online!==online;state.online=online;
+  $('connection-dot').className='dot '+(online?'connected':'disconnected');
+  $('connection-label').textContent=online?(eventStreamOnline?'本地服务在线':'服务在线 · 实时通知重连中'):'本地服务暂不可达';
+  if(changed)renderBridge(state.bridge);
+}
+async function checkServiceHealth(){
+  if(healthBusy||state.closed)return;healthBusy=true;const revision=serviceSuccessRevision;
+  try{const bridge=await request('/api/bridge',{signal:AbortSignal.timeout(5000)});if(state.closed)return;setServiceOnline(true);renderBridge(bridge);}
+  catch{if(revision===serviceSuccessRevision)setServiceOnline(false);}
+  finally{healthBusy=false;}
+}
 function openDirectory(directory){state.directoryDraft=directory?{...directory}:null;$('directory-title').textContent=directory?'项目设置':'添加目录';$('directory').value=directory?.path||'';$('directory').readOnly=Boolean(directory);$('directory-label').value=directory?.label===directory?.path?'':directory?.label||'';$('recursive').setAttribute('aria-checked',String(directory?.recursive===true));$('directory-control').setAttribute('aria-checked',String(directory?.claudeControlEnabled===true));$('directory-control-row').hidden=!directory;$('remove-directory').hidden=!directory;setError('directory-error');$('directory-dialog').showModal();}
 function openGroup(group,session,initial=[]){state.groupDraft={id:group?.id,revision:group?.revision||0,members:new Map((group?.members||initial).map(s=>[addressOf(s),s]))};if(session)state.groupDraft.members.set(addressOf(session),session);$('group-title').textContent=group?'编辑自定义项目':'新建自定义项目';$('group-name').value=group?.name||'';$('member-search').value='';$('delete-group').hidden=!group;setError('group-error');renderMemberPicker();$('group-dialog').showModal();}
 function renderMemberPicker(){const draft=state.groupDraft;if(!draft)return;const available=new Map(state.sessions.map(s=>[addressOf(s),s]));for(const[address,s]of draft.members)if(!available.has(address))available.set(address,s);const query=$('member-search').value.trim().toLocaleLowerCase(),focused=document.activeElement?.closest('.member-choice')?.dataset.address,scroll=$('member-list').scrollTop;$('member-list').replaceChildren();let count=0;
@@ -330,10 +347,12 @@ $('sidebar-toggle').addEventListener('click',()=>{if(matchMedia('(max-width:760p
 $('sidebar-close').addEventListener('click',closeMobileNavigation);$('sidebar-scrim').addEventListener('click',closeMobileNavigation);window.addEventListener('resize',()=>{if(!matchMedia('(max-width:760px)').matches)closeMobileNavigation();updateNavigationButton();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeMobileNavigation();});
 let discoverTimer,monitorTimer,messageTimer,eventMonitorTimer,eventMessageTimer;
-function connectEvents(){state.events=new EventSource('/api/events');state.events.addEventListener('open',()=>{state.online=true;$('connection-dot').className='dot connected';$('connection-label').textContent='本地服务在线';void loadBridge();void loadGroups();});state.events.addEventListener('error',()=>{state.online=false;$('connection-dot').className='dot disconnected';$('connection-label').textContent='连接已中断';renderBridge({connected:false});});state.events.addEventListener('bridge',e=>{try{renderBridge(JSON.parse(e.data));}catch{}});state.events.addEventListener('groups',()=>void loadGroups());state.events.addEventListener('management',()=>{clearTimeout(eventMonitorTimer);eventMonitorTimer=setTimeout(loadMonitoring,200);});state.events.addEventListener('message',()=>{clearTimeout(eventMessageTimer);eventMessageTimer=setTimeout(loadMessages,200);});}
+function connectEvents(){state.events=new EventSource('/api/events');state.events.addEventListener('open',()=>{eventStreamOnline=true;setServiceOnline(true);void loadBridge();void loadMonitoring();void loadGroups();});state.events.addEventListener('error',()=>{eventStreamOnline=false;setServiceOnline(state.online);void checkServiceHealth();});state.events.addEventListener('bridge',e=>{try{renderBridge(JSON.parse(e.data));}catch{}});state.events.addEventListener('groups',()=>void loadGroups());state.events.addEventListener('management',()=>{if(!eventMonitorTimer)eventMonitorTimer=setTimeout(()=>{eventMonitorTimer=null;void loadMonitoring();},200);});state.events.addEventListener('message',()=>{clearTimeout(eventMessageTimer);eventMessageTimer=setTimeout(loadMessages,200);});}
 window.addEventListener('pagehide',()=>{state.closed=true;state.events?.close();for(const t of [discoverTimer,monitorTimer,messageTimer,eventMonitorTimer,eventMessageTimer])clearTimeout(t);});
 try{
   try{const saved=JSON.parse(localStorage.getItem('cooperation-workspace-v2'));if(saved){state.mode=saved.mode==='custom'?'custom':'directories';state.picks=saved.picks||state.picks;state.selectedAddress=saved.address||null;state.expanded=new Set(saved.expanded||[]);state.known=new Set(saved.known||[]);}state.connectedOnly=localStorage.getItem('cooperation-connected-only-v1')==='true';}catch{}
   state.config=await request('/api/config');$('version').textContent='v'+state.config.version;state.directories=state.config.directories||[];state.bridge=state.config.bridge?.codexStatus;await loadSessions(true);renderBridge(state.bridge);connectEvents();updateNavigationButton();
   discoverTimer=setInterval(loadSessions,15000);monitorTimer=setInterval(loadMonitoring,2500);messageTimer=setInterval(loadMessages,10000);
 }catch(error){setError('global-error','无法连接本地管理服务：'+error.message);$('connection-label').textContent='服务未连接';}
+
+setupPromptEditor({ request, post, toast });

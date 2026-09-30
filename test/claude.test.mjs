@@ -74,11 +74,12 @@ test('directory selection excludes siblings and includes saved descendant sessio
   assert.equal(await findClaudeSession(randomUUID(), { configDir: root }), null);
 });
 
-test('Claude sender uses published peer auth, exact target and supplied text against a local mock inbox', async (t) => {
+for (const namespace of process.platform === 'win32' ? ['', 'LOCAL\\', 'local\\', 'LoCaL\\'] : ['']) {
+test(`Claude sender uses published peer auth, exact target and supplied text against a local mock inbox (${namespace || 'flat'})`, async (t) => {
   const root = await fixture(t);
   const cwd = path.join(root, 'test-workspace');
   const id = randomUUID();
-  const endpoint = process.platform === 'win32' ? `\\\\.\\pipe\\coop-claude-mock-${process.pid}-${randomUUID()}` : path.join(root, 'inbox.sock');
+  const endpoint = process.platform === 'win32' ? `\\\\.\\pipe\\${namespace}coop-claude-mock-${process.pid}-${randomUUID()}` : path.join(root, 'inbox.sock');
   const token = 'a'.repeat(32);
   const endpointHash = createHash('sha256').update(process.platform === 'win32' ? endpoint.toLowerCase() : endpoint).digest('hex');
   await registry(root, id, cwd, { messagingSocketPath: endpoint });
@@ -122,6 +123,43 @@ test('Claude sender uses published peer auth, exact target and supplied text aga
   assert.equal(result.deliveryConfirmed, false);
   assert.ok(!JSON.stringify(result).includes(token));
   assert.ok(!JSON.stringify(result).includes(endpoint));
+});
+}
+
+test('Windows peer inbox validation rejects remote and unsupported paths before authentication', { skip: process.platform !== 'win32' }, async t => {
+  const root = await fixture(t), id = randomUUID(), cwd = path.join(root, 'workspace');
+  for (const endpoint of [
+    '\\\\server\\pipe\\inbox',
+    '\\\\localhost\\pipe\\LOCAL\\inbox',
+    '\\\\?\\pipe\\LOCAL\\inbox',
+    '\\\\.\\pipe\\GLOBAL\\inbox',
+    '\\\\.\\pipe\\LOCAL\\nested\\inbox',
+    '\\\\.\\pipe\\LOCAL\\..\\inbox',
+    '\\\\.\\pipe\\LOCAL\\',
+    '\\\\.\\pipe\\LOCAL\\\\inbox',
+    '\\\\.\\pipe\\LOCAL/inbox',
+    '\\\\.\\pipe\\LOCAL\\inbox with spaces',
+    '\\\\.\\pipe\\LOCAL\\inbox\0',
+    '\\\\.\\pipe\\LOCAL\\inbox\n',
+    '\\\\.\\pipe\\inbox\n',
+  ]) {
+    await registry(root, id, cwd, { messagingSocketPath: endpoint });
+    await assert.rejects(sendClaudeMessage({ targetId: id, text: 'hello', configDir: root }), { code: 'CLAUDE_INVALID_INBOX' });
+  }
+});
+
+test('Windows LOCAL peer inbox retains key and process-lifetime checks', { skip: process.platform !== 'win32' }, async t => {
+  const root = await fixture(t), id = randomUUID(), cwd = path.join(root, 'workspace');
+  const endpoint = `\\\\.\\pipe\\LOCAL\\coop-claude-mock-${process.pid}-${randomUUID()}`;
+  const endpointHash = createHash('sha256').update(endpoint.toLowerCase()).digest('hex');
+  const keyPath = path.join(root, 'sessions', `${process.pid}.${endpointHash}.key`);
+  await registry(root, id, cwd, { messagingSocketPath: endpoint });
+  const send = () => sendClaudeMessage({ targetId: id, text: 'hello', configDir: root });
+  await assert.rejects(send(), { code: 'CLAUDE_PEER_KEY_UNAVAILABLE' });
+  await writeFile(keyPath, JSON.stringify({ peerToken: 'invalid' }));
+  await assert.rejects(send(), { code: 'CLAUDE_PEER_KEY_INVALID' });
+  await writeFile(keyPath, JSON.stringify({ peerToken: 'a'.repeat(32), procStartFt: '1' }));
+  await assert.rejects(send(), { code: 'CLAUDE_STALE_INBOX' });
 });
 
 test('Claude sender rejects invalid, offline and oversized targets before transport', async (t) => {

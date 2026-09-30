@@ -7,6 +7,8 @@ import { ManagementStore } from '../src/management-store.mjs';
 import { SessionMailbox } from '../src/session-mailbox.mjs';
 import { CheckpointService } from '../src/checkpoint-service.mjs';
 import { MaintenanceController } from '../src/maintenance-controller.mjs';
+import { PromptSettings } from '../src/prompt-settings.mjs';
+import { defaultPromptValues } from '../public/prompt-templates.mjs';
 
 async function harness(t, wasWorking = false, delayedInterrupt = false, recoveryEvidence) {
   const root = await mkdtemp(join(resolve('.'), '.maintenance-test-'));
@@ -73,6 +75,24 @@ test('receipt rejects a different session, wrong stage, wrong token and changed 
   await h.checkpoints.accept(request); h.endTurn(); await h.controller.advance(cycle.id); await h.controller.advance(cycle.id); await h.controller.advance(cycle.id); await h.controller.advance(cycle.id);
   await writeFile(cycle.handoffPath, 'modified'); await assert.rejects(h.receipt('restored'), /内容不一致/);
   assert.equal(h.store.activeCycle(h.target).id, cycle.id);
+});
+
+test('maintenance uses customized handoff, next-stage restore and continuation while preserving real checkpoint gates', async t => {
+  const h = await harness(t, true), settings = new PromptSettings(h.root), values = defaultPromptValues();
+  values.maintenance = { handoff: 'CUSTOM HANDOFF {{documentPath}}\n{{checkpoint}}', restore: 'OLD RESTORE\n{{checkpoint}}', continue: 'CUSTOM CONTINUE {{sessionId}}' };
+  await settings.save(values, 0);
+  await h.controller.advance(h.cycle.id); await h.controller.advance(h.cycle.id);
+  assert.ok(h.delivered[0].startsWith('CUSTOM HANDOFF ')); assert.ok(h.delivered[0].includes(h.cycle.handoffPath));
+  await mkdir(dirname(h.cycle.handoffPath), { recursive: true }); await writeFile(h.cycle.handoffPath, 'custom flow handoff');
+  await h.receipt('handoff'); h.endTurn();
+  values.maintenance.restore = 'UPDATED RESTORE {{cycleId}}\n{{checkpoint}}'; await settings.save(values, 1);
+  for (let i = 0; i < 4; i++) await h.controller.advance(h.cycle.id);
+  assert.ok(h.delivered[1].startsWith('UPDATED RESTORE ' + h.cycle.id));
+  assert.equal(h.store.cycle(h.cycle.id).controlPromptRevision, 2);
+  h.service.mailbox.deliverResume = async item => { h.delivered.push(item.text); return { status: 'submitted' }; };
+  await h.receipt('restored'); h.endTurn(); await h.controller.advance(h.cycle.id);
+  assert.equal(h.store.cycle(h.cycle.id).state, 'completed');
+  assert.equal(h.delivered[2], 'CUSTOM CONTINUE ' + h.target.id); assert.equal(h.compactCount(), 1);
 });
 test('native user intervention leaves the lock and queue for the user to resolve', async t => {
   const h = await harness(t); h.state.activeTurnId = 'new-native-user-turn';
