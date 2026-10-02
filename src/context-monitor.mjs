@@ -78,7 +78,8 @@ export class ContextMonitor {
     const policy = this.store.getPolicy(session);
     const cycle = this.store.activeCycle(session), lastCycle = this.store.lastCycle(session);
     const decision = evaluatePolicy({ policy, runtime, usage, cycle, lastCycle });
-    const sample = { session: { ...publicSession(session), hostId: session.hostId || 'local' }, runtime, usage: usage || null, decision, error: error || null, observedAt: new Date().toISOString() };
+    const sample = { session: { ...publicSession(session), hostId: session.hostId || 'local' }, runtime, usage: usage || null, decision,
+      quotaRecovery: this.store.getSetting('quota-recovery:' + key), error: error || null, observedAt: new Date().toISOString() };
     this.store.saveSnapshot(session, sample); this.onUpdate(session); return sample;
   }
   close() { this.closed = true; for (const adapter of this.clients.values()) adapter.close(); this.clients.clear(); }

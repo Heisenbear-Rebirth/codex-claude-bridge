@@ -90,6 +90,8 @@ export function createOpenCodeAdapter({ root = installationRoot, timeout = 15000
     async send({ targetId, text, messageId, targetSession, messageAffixes }) {
       const selected = await target(targetId, targetSession?.cwd); if (!selected) throw new Error('OpenCode backend unavailable.');
       const current = await rpc(selected.record, { action: 'status', targetId, includeUsage: false });
+      if (current.quota) return { status: 'deferred', notSubmitted: true, runtime: current,
+        detail: 'OpenCode 原生服务限流，消息已保留；请在原会话处理后继续。' };
       if (current.capabilities?.sendMessage !== true) return { status: 'failed', transport: 'opencode-plugin', error: 'OpenCode 原生 user 消息接收尚未显式开启。' };
       try { return await rpc(selected.record, { action: 'send', targetId, text, messageId, messageAffixes, cwd: targetSession?.cwd || selected.session.cwd }); }
       catch { return { status: 'unknown', transport: 'opencode-plugin', error: 'OpenCode 投递未确认，请核对原生记录，不要自动重发。' }; }

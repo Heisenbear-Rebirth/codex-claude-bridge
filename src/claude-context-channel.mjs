@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { publicNativeContext } from './context-usage.mjs';
+import { publicClaudeQuota } from './quota-state.mjs';
 
 // Responses to our own read-only requests must not leak into the IDE SDK's
 // request map. Every other line is forwarded byte-for-byte, including CRLF.
@@ -9,6 +10,7 @@ export class NativeContextChannel {
     return this.request('get_context_usage');
   }
   async interrupt() { return this.request('interrupt'); }
+  async quota() { return this.request('get_usage'); }
   async request(subtype) {
     if (this.active || this.requests.size >= 32 || !this.canQuery(subtype)) throw new Error('The session is not at an available input boundary.');
     this.active = true;
@@ -21,7 +23,8 @@ export class NativeContextChannel {
         if (request) { request.expired = true; request.reject(Object.assign(new Error('Native control request timed out; outcome unknown.'), { outcome: 'unknown' })); }
       }, 15000);
       this.requests.set(requestId, { resolve, reject, timer, expired: false, subtype });
-      try { this.write(Buffer.from(JSON.stringify({ type: 'control_request', request_id: requestId, request: { subtype } }) + '\n')); }
+      try { this.write(Buffer.from(JSON.stringify({ type: 'control_request', request_id: requestId,
+        request: { subtype, ...(subtype === 'get_usage' ? { skip_behaviors: true } : {}) } }) + '\n')); }
       catch (error) { clearTimeout(timer); this.requests.delete(requestId); this.active = false; reject(error); }
     });
   }
@@ -43,7 +46,7 @@ export class NativeContextChannel {
         if (!owned.expired) {
           if (message.response.subtype === 'success') owned.resolve(owned.subtype === 'interrupt'
             ? { stillQueuedIds: Array.isArray(message.response.response?.still_queued) ? message.response.response.still_queued.filter(id => typeof id === 'string') : [] }
-            : publicNativeContext(message.response.response));
+            : owned.subtype === 'get_usage' ? publicClaudeQuota(message.response.response) : publicNativeContext(message.response.response));
           else owned.reject(Object.assign(new Error('Claude rejected the native control request.'), { outcome: 'failed' }));
         }
       } else forward(line);

@@ -49,3 +49,121 @@ dialog{width:min(590px,calc(100vw - 32px));max-height:calc(100dvh - 48px);border
 /* Prompt settings use the existing workspace palette and dialog controls. */
 .prompt-dialog{width:min(1040px,calc(100vw - 32px));padding:25px}.prompt-dialog h2{margin:0}.prompt-description{margin-bottom:18px}.prompt-editor-body{border:0;padding:0;margin:0;min-width:0}.prompt-layout{display:grid;grid-template-columns:155px minmax(0,1fr);gap:24px}.prompt-navigation{display:flex;flex-direction:column;gap:5px;border-right:1px solid var(--line);padding-right:16px}.prompt-tab{text-align:left;padding:11px 12px;border-radius:8px;font-size:13px;background:transparent}.prompt-tab[aria-selected=true]{background:var(--tint);color:var(--accent);font-weight:600}.prompt-tab:hover{background:var(--tint)}.prompt-tab:nth-child(4){margin-top:20px}.prompt-panel{min-width:0}.prompt-panel-heading,.prompt-preview-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.prompt-panel-heading h3{font-size:17px;margin:0}.prompt-panel .field-label{margin-top:14px}.prompt-input{resize:vertical;line-height:1.75;min-height:42px;white-space:pre-wrap}.prompt-variables{margin-top:12px}.prompt-variables>div{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.prompt-variable{font:11px Consolas,monospace;background:var(--tint);color:var(--accent);padding:5px 8px;border-radius:6px}.prompt-preview-section{margin-top:20px;border-top:1px solid var(--line);padding-top:15px}.prompt-preview-heading{font-size:12px}.prompt-preview-heading label{font-size:11px;color:var(--muted)}.prompt-preview-heading select{border:1px solid var(--line);background:var(--surface);border-radius:6px;padding:4px;color:var(--ink);font:inherit}.prompt-preview{font:12px/1.75 Consolas,'Microsoft YaHei',monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;background:var(--surface-muted);border:1px solid var(--line);border-radius:9px;padding:15px;margin:12px 0 8px}.prompt-upgrade-note{margin:18px 0 10px}.prompt-dialog .dialog-footer{position:sticky;bottom:-25px;background:var(--surface);padding-bottom:14px}.prompt-dialog .notice{margin-top:12px}.prompt-editor-body:disabled{opacity:.65}.prompt-dialog [hidden]{display:none!important}
 @media(max-width:760px){.prompt-dialog{padding:18px;width:calc(100vw - 20px);max-height:calc(100dvh - 20px)}.prompt-layout{grid-template-columns:1fr;gap:18px}.prompt-navigation{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-right:0;border-bottom:1px solid var(--line);padding:0 0 12px;gap:4px}.prompt-tab{text-align:center;font-size:12px;padding:9px 4px}.prompt-tab:nth-child(4){margin-top:0}.prompt-dialog .dialog-footer{bottom:-18px;gap:8px}.prompt-dialog .dialog-footer .button{min-width:64px;padding:8px 10px}.prompt-dialog .dialog-footer>span:first-child{max-width:120px}.toolbar-actions #open-prompts{font-size:11px;padding:6px 8px}.prompt-preview{max-height:190px}}
+.dot.quota_limited{background:#c49242}.activity-badge.quota_limited{background:#fff0d7;color:#866024}
+
+/* Status first; settings stay available without dominating the working view. */
+:root{font-size:100%;--muted:#62676b}
+.session-card{gap:18px;align-items:start}
+.session-extra{margin-top:0;padding:20px 24px;border-color:#b8cfc5;background:#f4f8f4}
+.session-extra>h3.status-eyebrow{font-size:.75rem;color:var(--accent);letter-spacing:.04em;margin-bottom:10px}
+.session-extra .cycle-title{font-size:1.125rem;line-height:1.4;margin-bottom:8px;font-weight:650}
+.session-extra .cycle-reason{font-size:.875rem;line-height:1.7;margin-bottom:12px;color:#414c49}
+.session-extra .last-cycle{font-size:.8125rem;line-height:1.6;margin-bottom:7px}
+.session-actions{margin-top:15px;padding-top:12px;border-top:1px solid #d4dfd8}
+.session-summary,.compression-controls{padding:21px 24px}
+.usage-summary{margin:18px 0 10px}.usage-number{font-size:2.5rem;font-variant-numeric:tabular-nums}
+.usage-info,.freshness{font-size:.8125rem}.freshness{color:var(--muted)}
+.compression-controls .setting-row{margin-bottom:12px;padding-bottom:14px}
+.setting-row p,.policy-hint,.cycle-reason,.field-label,.subtitle,.dialog-description{font-size:.8125rem}
+.threshold-settings{margin:2px 0 16px;border-bottom:1px solid var(--line);padding-bottom:12px}
+.threshold-settings>summary{display:flex;align-items:center;flex-wrap:wrap;gap:7px 12px;cursor:pointer;list-style:none;padding:8px 0;font-size:.875rem}
+.threshold-settings>summary::after{content:'⌄';margin-left:auto;transition:transform 160ms ease}
+.threshold-settings[open]>summary::after{transform:rotate(180deg)}
+.threshold-summary{font-size:.8125rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.threshold-settings .threshold{margin-top:20px}.threshold-settings .policy-hint{margin-top:8px}
+.threshold-top{font-size:.875rem}.threshold-top small,.save-status,.policy-error{font-size:.8125rem}
+.threshold-range{height:28px;margin-top:8px}.text-input{font-family:inherit;font-size:.875rem}
+.button,.text-button,.prompt-tab,.session-title{font-size:.8125rem}
+.button,.icon-button,.member-card,.session-link{transition:background 120ms ease,box-shadow 120ms ease,transform 120ms ease}
+.button:not(:disabled):active,.icon-button:not(:disabled):active{transform:scale(.97);filter:brightness(.96);transition-duration:0s}
+.member-card:active,.session-link:active{background:var(--tint);transition-duration:0s}
+summary:focus-visible{outline:3px solid #68a99c;outline-offset:3px;border-radius:5px}
+.switch{width:44px;height:44px;background:transparent!important;border-radius:8px}
+.switch::before{content:'';position:absolute;width:40px;height:24px;top:10px;left:2px;border-radius:99px;background:#d8d8de;transition:background 180ms ease}
+.switch::after{top:13px;left:5px;transition:transform 180ms ease}
+.switch[aria-checked=true]::before{background:var(--accent)}
+.switch:not(:disabled):active::before{filter:brightness(.92)}
+.prompt-reset-actions{display:flex;align-items:center;flex-wrap:wrap;gap:12px 22px}
+.prompt-dialog .dialog-footer{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px}
+.prompt-dialog .dialog-footer .spacer{display:none}
+#prompt-save-status{grid-column:1/-1;max-width:none;min-height:1.5em;font-size:.8125rem}
+#prompt-discard{grid-column:1;justify-self:start}
+.prompt-dialog .dialog-footer>[data-close]{grid-column:2}
+#save-prompts{grid-column:3}
+dialog{opacity:0;transform:translateY(8px) scale(.97);transition:opacity var(--motion-dialog) var(--ease-out),transform var(--motion-dialog) var(--ease-out),display var(--motion-dialog) allow-discrete,overlay var(--motion-dialog) allow-discrete}
+dialog[open]{opacity:1;transform:translateY(0) scale(1)}
+dialog::backdrop{opacity:0;transition:opacity var(--motion-dialog) var(--ease-out),display var(--motion-dialog) allow-discrete,overlay var(--motion-dialog) allow-discrete}
+dialog[open]::backdrop{opacity:1}
+@starting-style{dialog[open]{opacity:0;transform:translateY(8px) scale(.97)}dialog[open]::backdrop{opacity:0}}
+@media(max-width:760px){
+  .workspace-toolbar{padding:0 12px;gap:6px;min-height:52px}.breadcrumb{gap:5px;flex:1;overflow:hidden}.toolbar-actions{gap:5px;flex:0 0 auto}
+  .workspace-heading{padding:18px 20px 14px}.workspace-heading h1{font-size:1.375rem}.workspace-actions .button{font-size:.75rem}
+  .session-card{gap:14px}.session-extra,.session-summary,.compression-controls{padding:18px 20px}.usage-number{font-size:2.25rem}
+  .icon-button,.project-heading>.icon-button{width:44px;height:44px}.project-toggle{width:44px;height:44px}.session-link{min-height:44px}
+  .threshold-settings>summary{min-height:44px}.session-disclosure>summary{min-height:44px;padding-top:12px;padding-bottom:12px}
+  .button,.text-button,.prompt-tab,.filter-button{min-height:44px}.threshold-value input{min-height:44px;font-size:1rem}.threshold-range{height:44px}
+  .text-input,.search input{font-size:1rem}.session-client{font-size:.75rem}
+  .sidebar,.sidebar:not(.mobile-open){display:flex;transform:translateX(-101%);visibility:hidden;transition:none}
+  .sidebar.mobile-open{display:flex;transform:translateX(0);visibility:visible}
+  body.navigation-motion .sidebar{transition:transform var(--motion-drawer) var(--ease-drawer),visibility 0s linear var(--motion-drawer)}
+  body.navigation-motion .sidebar.mobile-open{transition:transform var(--motion-drawer) var(--ease-drawer),visibility 0s}
+  #sidebar-scrim,#sidebar-scrim[hidden]{display:block!important;position:fixed;inset:0;width:100%;height:100%;z-index:11;border-radius:0;background:#0003;opacity:0;visibility:hidden;pointer-events:none;transition:none}
+  #sidebar-scrim:not([hidden]){opacity:1;visibility:visible;pointer-events:auto}
+  body.navigation-motion #sidebar-scrim{transition:opacity var(--motion-panel) var(--ease-out),visibility 0s linear var(--motion-panel)}
+  body.navigation-motion #sidebar-scrim:not([hidden]){transition:opacity var(--motion-panel) var(--ease-out),visibility 0s}
+  .prompt-dialog .dialog-footer{gap:8px}.prompt-dialog .dialog-footer>span:first-child{max-width:none}
+}
+@media(pointer:coarse){.icon-button{min-width:44px;min-height:44px}.button,.text-button,.filter-button{min-height:44px}button,summary,input[type=range]{touch-action:manipulation}}
+@media(prefers-reduced-motion:reduce){dialog,dialog[open]{transform:none;transition:none}.button:active,.icon-button:active{transform:none!important}.sidebar,#sidebar-scrim{transition:none!important}}
+@media(prefers-reduced-transparency:reduce){dialog::backdrop{backdrop-filter:none;background:#20202580}.workspace-toolbar{background:var(--surface)}}
+@media(prefers-contrast:more){:root{--muted:#333;--line:#737373;--line-strong:#555}.session-extra{border-color:#555}.cycle-reason,.freshness,.last-cycle{color:#333}dialog::backdrop{backdrop-filter:none;background:#0008}}
+.session-disclosure{display:block;font-size:12px;color:var(--muted);margin-top:16px}.session-disclosure summary{cursor:pointer;list-style-position:inside;width:fit-content;padding:7px 0;color:var(--ink)}.session-disclosure summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}.session-disclosure[open]>code{display:block;margin-top:8px}.maintenance-progress{display:flex;list-style:none;gap:12px;padding:0;margin:24px 0 18px;counter-reset:phase}.maintenance-progress li{counter-increment:phase;flex:1;display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}.maintenance-progress li::before{content:counter(phase);display:grid;place-items:center;width:25px;height:25px;flex:0 0 25px;border-radius:50%;background:var(--tint);color:var(--muted);font-size:11px}.maintenance-progress li.current{color:var(--accent);font-weight:600}.maintenance-progress li.current::before,.maintenance-progress li.complete::before{background:var(--accent);color:white}.maintenance-progress li.complete::before{content:'✓'}.maintenance-options .text-button{display:block;text-align:left}.maintenance-details{border-top:1px solid var(--line);padding-top:8px}.diagnostic-data{white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;padding:12px;background:var(--tint);border-radius:8px;font-size:11px;line-height:1.7}.connection-support{border-top:1px solid var(--line);padding-top:12px}.connection-steps[hidden]{display:none}.cycle-controls>.button{margin-top:8px}.session-extra .cycle-reason{line-height:1.8;max-width:68ch}@media(max-width:760px){.maintenance-progress{gap:6px}.maintenance-progress li{font-size:12px;gap:5px}.session-summary .identity{margin-top:16px}}
+
+/* Project restart confirmation */
+.restart-dialog{width:min(620px,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto}
+.restart-items{display:grid;gap:10px;margin:20px 0;max-height:42dvh;overflow:auto}
+.restart-item{display:flex;align-items:flex-start;gap:12px;padding:14px;border:1px solid var(--line,#dce3df);border-radius:12px;cursor:pointer}
+.restart-item input{margin-top:4px;accent-color:var(--accent,#287b6b);width:18px;height:18px;flex:none}
+.restart-item>span{display:grid;gap:6px;min-width:0;overflow-wrap:anywhere}
+.restart-item strong{font-size:14px}.restart-item span span{font-size:13px;line-height:1.5}.restart-item small{color:var(--muted,#68736d);font-size:12px}
+@media(max-width:600px){.restart-dialog .dialog-footer{flex-wrap:wrap}.restart-dialog .dialog-footer button{flex:1;white-space:normal}#restart-review{font-size:12px;padding-inline:8px}}
+/* One rhythm for occasional interactions; data refreshes stay still. */
+:root{--ease-out:cubic-bezier(.23,1,.32,1);--ease-in-out:cubic-bezier(.77,0,.175,1);--ease-drawer:cubic-bezier(.32,.72,0,1);--motion-press:140ms;--motion-fade:120ms;--motion-panel:180ms;--motion-disclosure:200ms;--motion-dialog:250ms;--motion-drawer:260ms}
+.button,.icon-button,.text-button,.member-card,.session-link,.filter-button,.prompt-tab{transition:background-color var(--motion-fade) ease,color var(--motion-fade) ease,border-color var(--motion-fade) ease,box-shadow var(--motion-fade) ease,transform var(--motion-press) var(--ease-out)}
+.switch::after{transition:transform 160ms var(--ease-out)}
+.switch::before,.activity-badge,.bridge-status,.dot,.maintenance-progress li::before{transition:background-color var(--motion-panel) ease,color var(--motion-panel) ease}
+.project-toggle span,.threshold-settings>summary::after{transition:transform var(--motion-panel) var(--ease-out)}
+.workspace-tabs{position:relative}
+.workspace-tabs.motion-ready button[aria-selected=true]{border-bottom-color:transparent}
+.workspace-tab-indicator{position:absolute;bottom:0;left:0;width:1px;height:2px;border-radius:2px;background:var(--accent);transform-origin:left center;pointer-events:none;transition:transform var(--motion-panel) var(--ease-in-out)}
+.mode-switch{position:relative;isolation:isolate}
+.mode-switch::before{content:'';position:absolute;z-index:-1;inset:3px auto 3px 3px;width:calc((100% - 8px)/2);border-radius:7px;background:var(--surface);box-shadow:0 1px 4px #00000013;transform:translateX(0);transition:transform var(--motion-panel) var(--ease-in-out)}
+.mode-switch:has(#mode-custom[aria-pressed=true])::before{transform:translateX(calc(100% + 2px))}
+.mode-switch button[aria-pressed=true]{background:transparent;box-shadow:none}
+.toast{opacity:1;transform:translate(-50%,0);transition:opacity var(--motion-panel) var(--ease-out),transform var(--motion-panel) var(--ease-out),display var(--motion-panel) allow-discrete}
+.toast[hidden]{opacity:0;transform:translate(-50%,8px)}
+@starting-style{.toast:not([hidden]){opacity:0;transform:translate(-50%,8px)}}
+/* Native details keeps its disclosure semantics. Older browsers switch instantly. */
+@supports (interpolate-size:allow-keywords) and selector(details::details-content){
+  details.threshold-settings,details.session-disclosure{interpolate-size:allow-keywords}
+  :is(details.threshold-settings,details.session-disclosure)::details-content{block-size:0;opacity:0;overflow:clip;transition:block-size var(--motion-disclosure) var(--ease-out),opacity var(--motion-panel) var(--ease-out),content-visibility var(--motion-disclosure) allow-discrete}
+  :is(details.threshold-settings,details.session-disclosure)[open]::details-content{block-size:auto;opacity:1}
+}
+@supports (interpolate-size:allow-keywords){
+  .project-sessions{interpolate-size:allow-keywords;block-size:auto;overflow:clip;opacity:1;visibility:visible;transition:block-size var(--motion-disclosure) var(--ease-out),opacity var(--motion-panel) var(--ease-out),visibility 0s}
+  .project-sessions[hidden]{display:block!important;block-size:0;opacity:0;visibility:hidden;transition:block-size var(--motion-disclosure) var(--ease-out),opacity var(--motion-panel) var(--ease-out),visibility 0s linear var(--motion-disclosure)}
+}
+@media(hover:hover) and (pointer:fine){
+  .member-card:hover{transform:translateY(-2px)}
+  .member-card:active{transform:translateY(0) scale(.99);transition-duration:0s}
+}
+@media(prefers-reduced-motion:reduce){
+  .member-card:hover,.member-card:active{transform:none!important}
+  .toast,.toast[hidden]{transform:translateX(-50%)!important}
+  .mode-switch::before,.switch::after,.threshold-settings>summary::after,details::details-content{transition:none!important}
+  dialog,dialog::backdrop{transition:opacity var(--motion-fade) ease,display var(--motion-fade) allow-discrete,overlay var(--motion-fade) allow-discrete!important}
+  .toast{transition:opacity var(--motion-fade) ease,display var(--motion-fade) allow-discrete!important}
+}
+/* Keyboard navigation is immediate; the next pointer press restores motion. */
+html[data-motion-input=keyboard] *,html[data-motion-input=keyboard] *::before,html[data-motion-input=keyboard] *::after,html[data-motion-input=keyboard] dialog::backdrop,html[data-motion-input=keyboard] details::details-content{transition:none!important;animation:none!important}
+html[data-motion-input=keyboard] .button:active,html[data-motion-input=keyboard] .icon-button:active,html[data-motion-input=keyboard] .member-card:active{transform:none!important}

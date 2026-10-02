@@ -23,6 +23,9 @@ export class SessionMailbox {
       let result;
       try {
         result = item.kind === 'message' ? await this.deliverMessage(this.store.getMessage(item.messageId)) : await this.deliverResume(item);
+        if (item.kind === 'message' && result?.status === 'deferred' && result.notSubmitted === true) {
+          this.store.deferOutbox(item.id, result); this.onMessage(item.messageId); return;
+        }
         if (!['submitted', 'unknown', 'failed'].includes(result?.status)) result = { status: 'failed', error: '原生客户端未接受该操作。' };
       } catch (error) { result = { status: error.outcome === 'unknown' ? 'unknown' : 'failed', error: error.message }; }
       this.store.finishOutbox(item.id, result); this.onMessage(item.messageId || item.id);

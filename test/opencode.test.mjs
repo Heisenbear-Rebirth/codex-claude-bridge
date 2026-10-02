@@ -231,6 +231,7 @@ test('Native OpenCode usage reaches the monitor and full-capacity percentage wit
 test('OpenCode usage diagnostics distinguish old plugins, missing samples, failures and recovery through HTTP', async t => {
   const f = await fixture(t), session = { client: 'opencode', id: f.sessions[0].id, cwd: f.root };
   const manager = await startServer({ root: f.root, port: 0, adapters: { opencode: f.adapter }, startMonitoring: false });
+  assert.ok(Number(new URL(manager.url).port) >= 20000);
   try {
     const config = await (await fetch(manager.url + '/api/config')).json();
     const sample = async () => {
@@ -243,7 +244,7 @@ test('OpenCode usage diagnostics distinguish old plugins, missing samples, failu
     f.adapter.status = async () => ({ connected: true, activity: 'running', capabilities: { readActivity: true }, usage: null });
     let monitoring = await sample();
     assert.equal(openCodeContextState({ ...session, monitoring }).label, '插件需要重新加载');
-    assert.match(openCodeContextState({ ...session, monitoring }).detail, /当前任务结束后重启该后端/);
+    assert.match(openCodeContextState({ ...session, monitoring }).detail, /当前任务结束后.*重新打开 OpenCode/);
     f.adapter.status = nativeStatus;
     monitoring = await sample();
     assert.equal(monitoring.runtime.usageState, 'no_measurement');

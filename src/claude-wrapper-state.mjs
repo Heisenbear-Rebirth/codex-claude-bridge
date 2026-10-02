@@ -1,5 +1,7 @@
 import { StringDecoder } from 'node:string_decoder';
 import { randomUUID } from 'node:crypto';
+import { claudeQuotaEvent } from './quota-state.mjs';
+import { knownModel } from './model-identity.mjs';
 
 // Observe framing without changing the bytes forwarded between the IDE and CLI.
 export class JsonLineObserver {
@@ -25,34 +27,88 @@ export class ClaudeProtocolState {
     this.hostRequests = new Map(); this.childRequests = new Map(); this.userSequence = 0;
     this.lastResultAt = null; this.permissionMode = null; this.activityRevision = 0; this.activeTurnId = null;
     this.lastCompletedTurnId = null; this.queuedInputIds = []; this.model = null; this.effort = null;
+    this.selectedModel = null; this.selectionRequests = new Map();
     this.capacities = new Map(); this.usage = null; this.contextEpoch = 0; this.backgroundTasks = new Set();
+    this.quota = null; this.turnQuotaEvent = null; this.turnQuotaError = false; this.userStopped = false;
+    this.expectedPeers = new Set();
+    this.lastObservedInputId = null; this.lastQuotaAssistantId = null;
   }
+  expectPeer(id) {
+    if (!/^[0-9a-f-]{36}$/i.test(id || '')) throw Error('Invalid peer message ID.');
+    if (this.expectedPeers.size >= 512 && !this.expectedPeers.has(id.toLowerCase())) throw Error('Peer observation queue is full.');
+    this.expectedPeers.add(id.toLowerCase());
+  }
+  forgetPeer(id) { this.expectedPeers.delete(id?.toLowerCase()); }
   begin(id) {
-    if (!this.active) { this.active = true; this.activeTurnId = id || `observed-${randomUUID()}`; this.activityRevision++; }
+    if (!this.active) {
+      this.quota = null; this.turnQuotaEvent = null; this.turnQuotaError = false;
+      this.lastQuotaAssistantId = null;
+      this.active = true; this.activeTurnId = id || this.queuedInputIds.shift() || `observed-${randomUUID()}`; this.activityRevision++;
+    }
+  }
+  settleInput(id, started = false) {
+    const index = this.queuedInputIds.indexOf(id);
+    if (index < 0) return;
+    this.queuedInputIds.splice(index, 1); this.activityRevision++;
+    // A queued prompt may be folded into the current turn. It is not another
+    // turn, and its terminal lifecycle alone is not a native result boundary.
+    if (started && !this.active) this.begin(id);
   }
   host(message) {
     if (message.type === 'user') {
+      this.quota = null;
+      if (!this.active) this.userStopped = false;
       this.userSequence++;
-      if (this.active) { this.queuedInputIds.push(message.uuid || `input-${this.userSequence}`); this.activityRevision++; }
-      else this.begin(message.uuid);
+      const id = message.uuid || `input-${this.userSequence}`;
+      this.lastObservedInputId = id;
+      if (this.active) {
+        if (id !== this.activeTurnId && !this.queuedInputIds.includes(id)) { this.queuedInputIds.push(id); this.activityRevision++; }
+      } else this.begin(id);
       if (this.usage) this.usage.historyChangedAfterMeasurement = true;
     }
-    if (message.type === 'control_request' && message.request_id) this.hostRequests.set(message.request_id, message.request?.subtype);
+    if (message.type === 'control_request' && message.request_id) {
+      this.hostRequests.set(message.request_id, message.request?.subtype);
+      if (message.request?.subtype === 'interrupt') { this.userStopped = true; if (this.quota) this.quota.autoResume = false; this.activityRevision++; }
+      if (['set_model', 'set_permission_mode', 'apply_flag_settings'].includes(message.request?.subtype)) {
+        if (this.quota) this.quota.autoResume = false; this.activityRevision++;
+      }
+      if (message.request?.subtype === 'set_model') this.selectionRequests.set(message.request_id, { model: knownModel(message.request.model) });
+      if (message.request?.subtype === 'set_permission_mode' && typeof message.request.mode === 'string') this.selectionRequests.set(message.request_id, { permissionMode: message.request.mode });
+    }
     if (message.type === 'control_response' && this.childRequests.delete(message.response?.request_id)) this.activityRevision++;
   }
   child(message) {
     if (message.parent_tool_use_id) return;
     if (this.sessionId && message.session_id && message.session_id.toLowerCase() !== this.sessionId) return;
     if (typeof message.session_id === 'string' && /^[0-9a-f-]{36}$/i.test(message.session_id)) this.sessionId = message.session_id.toLowerCase();
+    if (message.type === 'command_lifecycle' && ['started', 'completed', 'cancelled', 'discarded', 'refused'].includes(message.state))
+      this.settleInput(message.command_uuid, message.state === 'started');
+    if (message.type === 'user' && message.isReplay === true && message.message?.role === 'user') this.settleInput(message.uuid, true);
+    // A live peer arrives on the CLI's output stream, bypassing IDE stdin.
+    // Only IDs registered by a current delivery can begin an observed turn;
+    // historical replay by itself must never authorize an automatic wakeup.
+    if (message.type === 'user' && message.origin?.kind === 'peer' && message.message?.role === 'user' && typeof message.uuid === 'string'
+      && this.expectedPeers.has(message.uuid?.toLowerCase())) {
+      this.forgetPeer(message.uuid);
+      this.lastObservedInputId = message.uuid;
+      if (!this.active) { this.quota = null; this.turnQuotaEvent = null; this.turnQuotaError = false; this.begin(message.uuid); }
+      if (this.usage) this.usage.historyChangedAfterMeasurement = true;
+    }
     if (message.type === 'control_response') {
       const id = message.response?.request_id;
       if (this.hostRequests.get(id) === 'initialize' && message.response?.subtype === 'success') this.initialized = true;
+      const selection = this.selectionRequests.get(id);
+      if (selection && message.response?.subtype === 'success') {
+        if (Object.hasOwn(selection, 'model')) { this.selectedModel = selection.model; this.model = selection.model; }
+        if (selection.permissionMode) this.permissionMode = selection.permissionMode;
+      }
+      this.selectionRequests.delete(id);
       this.hostRequests.delete(id);
     }
     if (message.type === 'system' && message.subtype === 'init') {
       this.initialized = true;
       if (typeof message.permissionMode === 'string') this.permissionMode = message.permissionMode;
-      if (typeof message.model === 'string') this.model = message.model;
+      if (knownModel(message.model)) { this.selectedModel = message.model; this.model = message.model; }
     }
     if (message.type === 'control_request' && message.request_id) {
       this.childRequests.set(message.request_id, message.request?.subtype || 'unknown'); this.activityRevision++;
@@ -60,6 +116,10 @@ export class ClaudeProtocolState {
     if (message.type === 'control_cancel_request' && this.childRequests.delete(message.request_id)) this.activityRevision++;
     if (['assistant', 'stream_event', 'tool_progress', 'tool_use_summary'].includes(message.type)
       || (message.type === 'system' && message.subtype === 'status' && message.status === 'compacting')) this.begin();
+    if (message.type === 'rate_limit_event' && this.active) this.turnQuotaEvent = claudeQuotaEvent(message.rate_limit_info);
+    if (message.type === 'assistant' && ['rate_limit', 'rate_limit_error'].includes(message.error)) {
+      this.turnQuotaError = true; this.lastQuotaAssistantId = message.uuid || message.message?.id || null;
+    }
     if (message.type === 'system' && message.subtype === 'compact_boundary') { this.contextEpoch++; this.usage = null; }
     if (message.type === 'system' && message.subtype === 'task_started') this.backgroundTasks.add(message.task_id);
     if (message.type === 'system' && message.subtype === 'task_notification') this.backgroundTasks.delete(message.task_id);
@@ -72,21 +132,26 @@ export class ClaudeProtocolState {
       this.usage.measuredAt = new Date().toISOString(); this.applyCapacity();
     }
     if (message.type === 'result') {
+      const limited = this.turnQuotaError || this.turnQuotaEvent?.status === 'rejected' && message.is_error === true;
+      const knownWindow = this.turnQuotaEvent?.status === 'rejected' && ['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet'].includes(this.turnQuotaEvent.kind);
+      this.quota = limited && this.activeTurnId ? { kind: knownWindow ? this.turnQuotaEvent.kind : 'unknown_rate_limit', source: 'claude-native-error',
+        turnId: this.activeTurnId, resetsAt: this.turnQuotaEvent?.resetsAt || null, autoResume: Boolean(knownWindow && !this.userStopped) } : null;
+      this.turnQuotaEvent = null; this.turnQuotaError = false;
       for (const [model, usage] of Object.entries(message.modelUsage || {})) {
         if (Number.isFinite(usage.contextWindow) && usage.contextWindow > 0) this.capacities.set(model, usage.contextWindow);
       }
       if (this.usage) this.applyCapacity();
       this.lastCompletedTurnId = this.activeTurnId; this.activeTurnId = null;
       this.active = false; this.activityRevision++; this.lastResultAt = new Date().toISOString();
-      // Queued native inputs make the boundary unavailable until their next output.
-      if (this.queuedInputIds.length) this.begin(this.queuedInputIds.shift());
+      // Unacknowledged inputs keep controls blocked, but do not prove that a
+      // second turn has started. Only native lifecycle/output can start it.
     }
   }
   observeApiUsage(model, usage) {
-    if (typeof model !== 'string') return;
-    this.model = model;
+    if (!knownModel(model)) return;
     const values = ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].map(key => usage[key]);
     if (!values.every(n => Number.isFinite(n) && n >= 0)) return;
+    if (!this.selectedModel) this.model = model;
     const inputTokens = values.reduce((a, b) => a + b, 0), outputTokens = Number.isFinite(usage.output_tokens) ? usage.output_tokens : 0;
     this.usage = { source: 'claude-passive-api-usage', model, inputTokens, outputTokens, usedTokens: inputTokens + outputTokens,
       measuredAt: new Date().toISOString(), contextEpoch: this.contextEpoch, historyChangedAfterMeasurement: false };
@@ -108,13 +173,16 @@ export class ClaudeProtocolState {
     if (requests.includes('can_use_tool')) return 'waiting_permission';
     if (requests.includes('request_user_dialog')) return 'waiting_input';
     if (requests.length || this.hostRequests.size) return 'unknown';
-    return this.active ? 'running' : 'idle';
+    return this.active ? 'running' : this.quota ? 'quota_limited' : this.expectedPeers.size || this.queuedInputIds.length ? 'unknown' : 'idle';
   }
-  canCompact(atBoundary = true) { return this.initialized && this.sessionId && !this.active && !this.inputEnded && this.hostRequests.size === 0 && this.childRequests.size === 0 && !this.queuedInputIds.length && !this.backgroundTasks.size && atBoundary; }
+  canReadQuota(atBoundary = true) { return this.initialized && this.sessionId && !this.inputEnded && this.hostRequests.size === 0 && this.childRequests.size === 0 && atBoundary; }
+  canQuery(atBoundary = true) { return this.initialized && this.sessionId && !this.active && !this.inputEnded && this.hostRequests.size === 0 && this.childRequests.size === 0 && !this.queuedInputIds.length && !this.backgroundTasks.size && atBoundary; }
+  canCompact(atBoundary = true) { return !this.quota && !this.expectedPeers.size && this.canQuery(atBoundary); }
   publicState() { return { sessionId: this.sessionId, initialized: this.initialized, busy: this.active,
     activity: this.activity(), activityRevision: this.activityRevision, activeTurnId: this.activeTurnId, turnIdSource: 'wrapper-observed-input',
     lastCompletedTurnId: this.lastCompletedTurnId, queuedNativeInputs: this.queuedInputIds.length, backgroundTasks: this.backgroundTasks.size,
+    lastObservedInputId: this.lastObservedInputId,
     pendingHostControls: this.hostRequests.size, pendingClientControls: this.childRequests.size,
     inputEnded: this.inputEnded, lastResultAt: this.lastResultAt, permissionMode: this.permissionMode, model: this.model, effort: this.effort,
-    usage: this.usage }; }
+    pendingPeerMessages: this.expectedPeers.size, userStopped: this.userStopped, quota: this.quota, usage: this.usage }; }
 }

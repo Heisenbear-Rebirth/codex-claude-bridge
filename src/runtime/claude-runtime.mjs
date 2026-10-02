@@ -51,13 +51,23 @@ export class ClaudeRuntime {
   async status() {
     const state = await this.request('/status');
     if (state.instanceId !== this.record.instanceId || state.sessionId !== this.id) throw new Error('CLAUDE_INSTANCE_CHANGED');
-    return { client: 'claude', ...state };
+    const requiresReopen = state.capabilities?.quotaRecovery !== true || state.capabilities?.peerQuotaRecovery !== true || state.capabilities?.inputLifecycle !== true;
+    return { client: 'claude', ...state, requiresReopen, ...(requiresReopen ? {
+      capabilities: { ...state.capabilities, automaticMaintenance: false },
+      detail: '当前 Claude 接入需要更新；请在当前任务结束后正常重开此面板一次，加载额度与排队状态修复。自动维护已暂停。',
+    } : {}) };
   }
   async context() { return this.request('/context?sessionId=' + encodeURIComponent(this.id)); }
-  async control(kind, expected, { text, requestId = randomUUID() } = {}) {
+  async quota() { return (await this.request('/quota?sessionId=' + encodeURIComponent(this.id))).quota; }
+  async resumeQuota(text, expected, options) {
+    if (expected.activity !== 'quota_limited' || !expected.quota?.autoResume) return { status: 'state_conflict' };
+    return this.control('quota-resume', expected, { text, requestId: controlRequestId(options), canDispatch: options?.canDispatch });
+  }
+  async control(kind, expected, { text, requestId = randomUUID(), canDispatch } = {}) {
     const now = await this.status();
     if (now.protocolVersion !== 2) throw new Error('CLAUDE_WRAPPER_REOPEN_REQUIRED');
-    if (expected.instanceId !== now.instanceId || expected.activityRevision !== now.activityRevision || expected.activeTurnId !== now.activeTurnId)
+    if (now.requiresReopen && kind !== 'interrupt') return { status: 'state_conflict' };
+    if (expected.instanceId !== now.instanceId || expected.activityRevision !== now.activityRevision || expected.activeTurnId !== now.activeTurnId || canDispatch && !canDispatch())
       return { status: 'state_conflict' };
     return this.request('/' + kind, { sessionId: this.id, instanceId: now.instanceId, requestId,
       expectedTurnId: now.activeTurnId, expectedActivityRevision: now.activityRevision, ...(text === undefined ? {} : { text }) });
@@ -70,13 +80,32 @@ export class ClaudeRuntime {
     if (kind !== 'peer') throw new Error('Invalid Claude message kind.');
     // Peer delivery is valid while busy and must never invoke interrupt or
     // pretend that external agent content is a user/maintenance instruction.
-    let visibility;
+    let visibility, observed;
     try {
       const state = await this.status();
+      observed = state;
       visibility = { replayEnabled: state.capabilities?.peerMessageVisibility === true,
         historyEnabled: state.capabilities?.peerHistoryVisibility === true, displayConfirmed: false };
     } catch { visibility = { replayEnabled: false, historyEnabled: false, displayConfirmed: false }; }
-    const result = await this.sendPeer({ targetId: this.id, text, messageId: requestId });
+    const deferred = state => ({ status: 'deferred', notSubmitted: true, detail: '接收会话额度不足，消息已保留，等待额度恢复。', runtime: { client: 'claude', ...state } });
+    if (observed?.quota) return deferred(observed);
+    let prepared = false;
+    const observe = action => this.request('/peer-intent', { sessionId: this.id, instanceId: observed.instanceId, messageId: requestId, action });
+    if (observed?.capabilities?.peerQuotaRecovery) {
+      let result;
+      try { result = await observe('prepare'); }
+      catch { return { status: 'deferred', notSubmitted: true, reason: 'receiver_unavailable', detail: '暂时无法确认接收会话状态，消息已保留，稍后自动重试。' }; }
+      if (result.status === 'deferred') return result.runtime?.quota ? deferred(result.runtime) : result;
+      if (result.status !== 'ready') return { status: 'deferred', notSubmitted: true, reason: 'receiver_unavailable', detail: '接收会话尚未就绪，消息已保留。' };
+      prepared = true;
+    }
+    let result;
+    try { result = await this.sendPeer({ targetId: this.id, text, messageId: requestId }); }
+    catch (error) {
+      if (prepared && error.outcome === 'not_submitted') await observe('cancel').catch(() => {});
+      throw error;
+    }
+    if (prepared && result.status === 'failed') await observe('cancel').catch(() => {});
     return { ...result, visibility, ...(!visibility.replayEnabled
       ? { detail: '本次使用普通 peer 通道；接收端尚未启用可见消息，请在工作结束后重新打开已接入的 Claude 面板。' } : {}) };
   }
@@ -86,7 +115,7 @@ export class ClaudeRuntime {
   async compact(expected, options) {
     const requestId = controlRequestId(options);
     const current = await this.status();
-    if (current.activity !== 'idle' || !current.canCompact || (expected && (current.instanceId !== expected.instanceId || current.activityRevision !== expected.activityRevision))) return { status: 'state_conflict' };
+    if (current.requiresReopen || current.activity !== 'idle' || !current.canCompact || (expected && (current.instanceId !== expected.instanceId || current.activityRevision !== expected.activityRevision))) return { status: 'state_conflict' };
     return this.request('/compact', { sessionId: this.id, instanceId: current.instanceId, requestId });
   }
   close() {}

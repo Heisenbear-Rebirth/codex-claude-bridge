@@ -17,6 +17,7 @@ import { ProjectGroups } from './project-groups.mjs';
 import { PromptSettings } from './prompt-settings.mjs';
 import { defaultPromptValues } from '../public/prompt-templates.mjs';
 import { promptPreviewSamples } from './maintenance-prompts.mjs';
+import { listenLoopback } from './loopback-server.mjs';
 
 export async function startServer({ root, port = 47821, host = '127.0.0.1', defaultDirectory = root, codexContext, adapters, bridgeProbe, runtimeFactory, lifecycleDirectories, startMonitoring = true, onShutdown = () => {} } = {}) {
   if (host !== '127.0.0.1') throw new Error('管理台仅允许监听 127.0.0.1。');
@@ -48,7 +49,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
   } });
   const monitor = new ContextMonitor({ store, service, runtimeFactory, onUpdate: session => publish('management', { client: session.client, id: session.id }) });
   const controller = new MaintenanceController({ root, store, service, monitor, onUpdate: session => publish('management', { client: session.client, id: session.id }) });
-  const checkpoints = new CheckpointService({ root, store, onReceipt: cycleId => publish('management', { cycleId }) });
+  const checkpoints = new CheckpointService({ root, store, readRuntime: session => monitor.runtime(session).status(), onReceipt: cycleId => publish('management', { cycleId }) });
   const wrapperSettings = new WrapperDirectorySettings(root);
   const groups = new ProjectGroups(store);
   const prompts = new PromptSettings(root);
@@ -87,7 +88,7 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
         return json(response, 405, { error: 'Method not allowed' });
       }
       if (request.method === 'GET' && url.pathname === '/api/config') {
-        return json(response, 200, { version: '0.2.0', installationDirectory: root, defaultDirectory, directories: await directoryRecords(), policyDefaults: POLICY_DEFAULTS, csrfToken,
+        return json(response, 200, { version: '0.2.0', bootId: store.restartConfirmation.bootId, installationDirectory: root, defaultDirectory, directories: await directoryRecords(), policyDefaults: POLICY_DEFAULTS, csrfToken,
           lifecycle: service.lifecycle.capabilities(), lifecycleDirectories: service.lifecycle.directories,
           bridge: { codex: bridgeStatus().connected, codexStatus: bridgeStatus() }, warnings: store.warnings });
       }
@@ -130,14 +131,19 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
         return json(response, 200, { group, groups: groups.list() });
       }
       if (request.method === 'GET' && url.pathname === '/api/monitoring') {
-        return json(response, 200, { sessions: store.db.prepare('SELECT data FROM snapshots').all().map(row => {
+        return json(response, 200, { bootId: store.restartConfirmation.bootId, restartConfirmations: store.restartConfirmation.list(), sessions: store.db.prepare('SELECT data FROM snapshots').all().map(row => {
           const snapshot = JSON.parse(row.data); return { ...snapshot, policy: store.getPolicy(snapshot.session),
             cycle: service.publicCycle(store.activeCycle(snapshot.session)), lastCycle: service.publicCycle(store.lastCycle(snapshot.session)), queueCount: store.queueCount(snapshot.session), queueState: store.queueState(snapshot.session) };
         }) });
       }
-      if (request.method === 'POST' && ['/api/directories', '/api/directories/remove', '/api/directories/claude-control', '/api/policies', '/api/runtime', '/api/cycles/action', '/api/messages/resolve', '/api/queue/release'].includes(url.pathname)) {
+      if (request.method === 'POST' && ['/api/restart-confirmation', '/api/directories', '/api/directories/remove', '/api/directories/claude-control', '/api/policies', '/api/runtime', '/api/cycles/action', '/api/messages/resolve', '/api/queue/release'].includes(url.pathname)) {
         if (!equal(request.headers['x-coop-ui'], csrfToken)) return json(response, 403, { error: '请从本地管理页面操作。' });
         const input = await body(request);
+        if (url.pathname === '/api/restart-confirmation') {
+          const restartConfirmations = store.restartConfirmation.decide(input);
+          publish('management', { restart: true });
+          return json(response, 200, { bootId: store.restartConfirmation.bootId, restartConfirmations });
+        }
         if (url.pathname === '/api/directories') {
           const directory = store.saveDirectory({ ...await validateDirectory(input.path), label: typeof input.label === 'string' ? input.label.slice(0, 200) : '', recursive: input.recursive === true });
           return json(response, 200, { directory, directories: await directoryRecords() });
@@ -253,16 +259,19 @@ export async function startServer({ root, port = 47821, host = '127.0.0.1', defa
           kind: 'opencode-tool-context', instanceId: input.instanceId, nativeMessageId: input.nativeMessageId, nativeUserMessageId: input.nativeUserMessageId,
         }));
       }
-      const assets = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui-state.mjs': ['ui-state.mjs', 'text/javascript'], '/prompt-editor.mjs': ['prompt-editor.mjs', 'text/javascript'], '/prompt-templates.mjs': ['prompt-templates.mjs', 'text/javascript'], '/styles.css': ['styles.css', 'text/css'] };
+      const assets = { '/restart-confirmation.mjs': ['restart-confirmation.mjs', 'text/javascript'], '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/ui-state.mjs': ['ui-state.mjs', 'text/javascript'], '/connection-guidance.mjs': ['connection-guidance.mjs', 'text/javascript'], '/maintenance-view.mjs': ['maintenance-view.mjs', 'text/javascript'], '/prompt-editor.mjs': ['prompt-editor.mjs', 'text/javascript'], '/prompt-templates.mjs': ['prompt-templates.mjs', 'text/javascript'], '/styles.css': ['styles.css', 'text/css'] };
       if (request.method === 'GET' && assets[url.pathname]) {
         const [filename, type] = assets[url.pathname];
         response.writeHead(200, { 'Content-Type': `${type}; charset=utf-8` });
         response.end(await readFile(join(root, 'public', filename))); return;
       }
       json(response, 404, { error: '接口不存在。' });
-    } catch (error) { json(response, error.statusCode || 400, { error: error.message, ...(error.notSubmitted === true ? { notSubmitted: true } : {}) }); }
+    } catch (error) { json(response, error.statusCode || 400, { error: error.message, ...(error.code ? { code: error.code } : {}), ...(error.notSubmitted === true ? { notSubmitted: true } : {}) }); }
   });
-  try { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); }); }
+  try {
+    if (port === 0) await listenLoopback(server);
+    else await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
+  }
   catch (error) { await controller.close(); await service.mailbox.close(); await codexBridge?.close(); store.close(); throw error; }
   actualPort = server.address().port;
   const connection = { url: `http://${host}:${actualPort}`, token, pid: process.pid, startedAt: new Date().toISOString() };

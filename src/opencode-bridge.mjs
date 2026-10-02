@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { randomBytes, randomUUID, randomInt, createHash, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, writeFile, unlink, rename } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { parseAddress } from './address.mjs';
@@ -8,6 +8,8 @@ import { readAccessPolicy } from './access-policy.mjs';
 import { OpenCodeMaintenance } from './opencode-maintenance.mjs';
 import { readPromptSettings } from './prompt-settings.mjs';
 import { applyMessageAffixes, validatePromptValues } from '../public/prompt-templates.mjs';
+import { listenLoopback } from './loopback-server.mjs';
+export { listenLoopback as listenOpenCodeBridge } from './loopback-server.mjs';
 
 export const installationRoot = resolve(import.meta.dirname, '..');
 export const sameDirectory = (a, b) => typeof a === 'string' && typeof b === 'string'
@@ -30,23 +32,6 @@ export function nativeMessageId() {
   return 'msg_' + BigInt.asUintN(48, clock).toString(16).padStart(12, '0') + randomBytes(7).toString('hex');
 }
 const capabilities = { readActivity: true, sendMessage: true, automaticMaintenance: false, sendControl: false, compact: false, interrupt: false, observeCompletion: false };
-
-export async function listenOpenCodeBridge(server, choosePort = () => randomInt(20000, 65536)) {
-  // Windows may allocate port 0 from a low custom dynamic range. Some such
-  // ports (e.g. 6000/6667/10080) are rejected by the native Fetch client.
-  for (let attempt = 0; attempt < 16; attempt++) {
-    try {
-      await new Promise((ok, fail) => {
-        const error = e => { server.off('listening', ready); fail(e); };
-        const ready = () => { server.off('error', error); ok(); };
-        server.once('error', error); server.once('listening', ready);
-        server.listen(choosePort(), '127.0.0.1');
-      });
-      return;
-    } catch (e) { if (e.code !== 'EADDRINUSE') throw e; }
-  }
-  throw new Error('No available local OpenCode bridge port.');
-}
 
 // The SDK client is supplied by OpenCode itself, including an in-process fetch
 // for standalone TUI. Never start a replacement backend or copy provider keys.
@@ -173,6 +158,11 @@ export async function createOpenCodeBridge({ client, directory }, { root = insta
       if (old.inputFingerprint ? old.inputFingerprint !== inputFingerprint : old.fingerprint !== fingerprint) throw new Error('Cooperation message ID was reused with different content or target.');
       return { ...old.result, nativeMessageId: old.nativeMessageId, ...(await evidence(old).catch(() => ({ nativeRecorded: false }))), duplicate: true };
     }
+    if (maintenance.supported) {
+      const runtime = await maintenance.status(input.targetId);
+      if (runtime.quota) return { status: 'deferred', notSubmitted: true, runtime,
+        detail: 'OpenCode 原生服务限流，消息已保留；请在原会话处理额度或限流后继续。' };
+    }
     const entry = { fingerprint, inputFingerprint, targetId: input.targetId, nativeMessageId: nativeMessageId(), nativeTextHash: digest(text),
       instanceId, createdAt: new Date().toISOString(), result: { status: 'unknown', transport: 'opencode-plugin', nativeRecorded: false, modelProcessed: false, displayConfirmed: false } };
     // Persist intent before native submission. A crash or lost response never retries it.
@@ -259,7 +249,7 @@ export async function createOpenCodeBridge({ client, directory }, { root = insta
       reply(200, await dispatch(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
     } catch { reply(400, { error: 'OpenCode bridge request rejected; check target, instance and receive opt-in.' }); }
   });
-  await listenOpenCodeBridge(server);
+  await listenLoopback(server);
   server.unref();
   const record = { instanceId, token, endpoint: 'http://127.0.0.1:' + server.address().port, directory, pid: process.pid, startedAt: new Date().toISOString(), protocol: 1 };
   const registration = join(folder, instanceId + '.json');

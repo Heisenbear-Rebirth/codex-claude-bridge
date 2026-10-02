@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { CodexIpc } from './codex-ipc.mjs';
 import { normalizeDirectory } from '../directory-service.mjs';
+import { codexQuotaFailure, freshAvailableQuota } from '../quota-state.mjs';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex');
 const text = value => typeof value === 'string' ? value : null;
@@ -33,6 +34,36 @@ export function samePermissionSelection(before, after) {
   return before.permissionFingerprintBasis === 'permission-selection-excluding-native-visualization-root'
     && after.legacyPermissionFingerprints?.includes(before.permissionFingerprint) === true;
 }
+function turnTime(turn) {
+  const value = turn?.startedAt ?? turn?.createdAt ?? turn?.started_at;
+  if (typeof value === 'number' && Number.isFinite(value)) return value < 1e11 ? value * 1000 : value;
+  const parsed = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function currentTurnHead(canonical, legacy) {
+  if (!canonical.length) return { latest: legacy.at(-1), candidates: legacy.slice(-1), uncertain: false };
+  const head = canonical.at(-1), ids = new Set(canonical.map(t => t.turnId));
+  const lastCommon = legacy.findLastIndex(t => ids.has(t.turnId));
+  const suffix = legacy.slice(lastCommon + 1).filter(t => !ids.has(t.turnId));
+  const same = legacy.findLast(t => t.turnId === head.turnId);
+  let current = head;
+  if (same?.status === 'failed' && head.status === 'failed' && !head.error) current = { ...head, error: same.error };
+  if (!suffix.length) {
+    const lagging = head.status === 'inProgress' && same && ['failed', 'completed', 'interrupted'].includes(same.status);
+    return { latest: current, candidates: lagging ? [current, same] : [current], uncertain: Boolean(lagging) };
+  }
+  // The shared head is an ordering anchor. Without an anchor, use native
+  // timestamps; never assume that an unrelated legacy turn is newer or older.
+  if (lastCommon >= 0 && legacy[lastCommon].turnId === head.turnId)
+    return { latest: suffix.at(-1), candidates: suffix.slice(-1), uncertain: false };
+  const candidates = [current, suffix.at(-1)];
+  const times = candidates.map(turnTime);
+  if (times.every(t => t !== null) && times[0] !== times[1]) {
+    const latest = candidates[times[0] > times[1] ? 0 : 1];
+    return { latest, candidates: [latest], uncertain: false };
+  }
+  return { latest: current, candidates, uncertain: true };
+}
 export function projectCodexState(s) {
   // Only retain control metadata. The IPC snapshot may contain history text;
   // neither the runtime snapshot nor its event log keeps that text.
@@ -40,29 +71,29 @@ export function projectCodexState(s) {
   const canonical = history?.islands?.flatMap(island => island.entries?.map(entry => history.entitiesByKey?.[entry.value]) || []).filter(Boolean) || [];
   const legacy = Array.isArray(s.turns) ? s.turns : [];
   const turns = [...canonical, ...legacy];
-  // Old canonical turns can retain inProgress after a native interruption.
-  // The chronological head determines current activity; a separate legacy
-  // turn is still considered until canonical history contains that turn ID.
-  const canonicalIds = new Set(canonical.map(t => t.turnId));
-  const currentTurns = canonical.length ? [canonical.at(-1), ...legacy.filter(t => !canonicalIds.has(t.turnId))] : legacy;
+  // Historical in-progress turns cannot establish current activity. Mixed
+  // snapshots must establish a chronological head before any native control.
+  const head = currentTurnHead(canonical, legacy), currentTurns = head.candidates;
   const active = currentTurns.filter(t => t.status === 'inProgress' && t.turnId);
   const activeIds = [...new Set(active.map(t => t.turnId))];
-  const latest = canonical.at(-1) || turns.at(-1);
+  const latest = head.latest;
   const flags = s.threadRuntimeStatus?.activeFlags || [];
   let activity = 'unknown';
   if (s.threadRuntimeStatus?.type === 'notLoaded' || s.resumeState === 'needs_resume') activity = 'unloaded';
   else if (flags.includes('waitingOnApproval')) activity = 'waiting_permission';
   else if (flags.includes('waitingOnUserInput')) activity = 'waiting_input';
-  else if (s.threadRuntimeStatus?.type === 'active' && activeIds.length === 1) activity = 'running';
-  else if (s.threadRuntimeStatus?.type === 'idle' && activeIds.length === 0 && !s.requests?.length && !s.unconfirmedTurnSubmissions?.length
+  else if (!head.uncertain && s.threadRuntimeStatus?.type === 'active' && activeIds.length === 1) activity = 'running';
+  else if (!head.uncertain && s.threadRuntimeStatus?.type === 'idle' && activeIds.length === 0 && !s.requests?.length && !s.unconfirmedTurnSubmissions?.length
     && (!latest || ['completed', 'interrupted', 'failed'].includes(latest.status))) activity = 'idle';
+  const quota = codexQuotaFailure(latest) || (head.uncertain ? currentTurns.map(codexQuotaFailure).find(Boolean) : null) || null;
+  if (activity === 'idle' && quota) activity = 'quota_limited';
   const model = text(s.latestModel) || text(s.latestCollaborationMode?.settings?.model);
   const effort = s.latestThreadSettings?.effort !== undefined ? text(s.latestThreadSettings.effort)
     : s.latestCollaborationMode?.settings?.reasoning_effort !== undefined ? text(s.latestCollaborationMode.settings.reasoning_effort) : text(s.latestReasoningEffort);
   const permissions = permissionSelection(s.currentPermissions, s.id, undefined, s.cwd);
   const implicitCwd = structuredClone(permissions);
   if (implicitCwd?.sandboxPolicy?.type === 'workspaceWrite') implicitCwd.sandboxPolicy.writableRoots = implicitCwd.sandboxPolicy.writableRoots.filter(path => path !== normalizeDirectory(s.cwd));
-  return { activity, activeTurnId: activeIds.length === 1 ? activeIds[0] : null,
+  return { activity, quota, turnOrderUncertain: head.uncertain, activeTurnId: activeIds.length === 1 ? activeIds[0] : null,
     subagentHistoryPresent: turns.some(turn => turn.items?.some(item => item.type === 'collabAgentToolCall')),
     historicalInProgressTurns: canonical.slice(0, -1).filter(t => t.status === 'inProgress').length,
     pendingRequests: s.requests?.length || 0, runtimeStatus: text(s.threadRuntimeStatus?.type),
@@ -92,7 +123,9 @@ export class CodexRuntime {
         let projected; try { projected = projectCodexState(change.conversationState); } catch { return; }
         const signature = hash({ activity: projected.activity, activeTurnId: projected.activeTurnId,
           pendingRequests: projected.pendingRequests, model: projected.model, effort: projected.effort,
-          permissions: projected.permissionFingerprint, goal: projected.goalStatus, subagents: projected.subagentHistoryPresent });
+          permissions: projected.permissionFingerprint, goal: projected.goalStatus, subagents: projected.subagentHistoryPresent,
+          head: projected.latestTurn?.id, quota: projected.quota, turnOrderUncertain: projected.turnOrderUncertain,
+          unconfirmedSubmissions: projected.unconfirmedSubmissions });
         if (signature !== this.signature) { this.activityRevision++; this.signature = signature; }
         this.snapshot = { ...projected, activityRevision: this.activityRevision, streamRevision: change.revision, observedAt: new Date().toISOString() };
         for (const resolve of this.waiters) resolve(this.snapshot); this.waiters.clear();
@@ -149,9 +182,16 @@ export class CodexRuntime {
       interruptedTurnId: response.result?.interruptedTurnId ?? null } : { status: 'unknown', detail: 'Native interrupt did not confirm its outcome.' };
   }
   async sendControl(message, expected) {
+    return this.startMessage(message, expected, 'idle');
+  }
+  async resumeQuota(message, expected, { quota, canDispatch } = {}) {
+    if (!freshAvailableQuota(quota) || !expected.quota?.autoResume) return { status: 'state_conflict' };
+    return this.startMessage(message, expected, 'quota_limited', canDispatch);
+  }
+  async startMessage(message, expected, activity, canDispatch) {
     if (typeof message !== 'string' || !message.trim()) throw new Error('A non-empty control message is required.');
-    const current = await this.checkExpected(expected, 'idle');
-    if (!current) return { status: 'state_conflict' };
+    const current = await this.checkExpected(expected, activity);
+    if (!current || canDispatch && !canDispatch()) return { status: 'state_conflict' };
     const response = await this.ipc.request('thread-follower-start-turn', { conversationId: this.id,
       turnStart: { request: { threadId: this.id, input: [{ type: 'text', text: message, text_elements: [] }] },
         context: { inheritThreadSettings: true } } }, this.ownerId, 20000);

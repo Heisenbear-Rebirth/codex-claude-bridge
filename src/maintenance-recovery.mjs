@@ -44,6 +44,30 @@ async function scan(file, visit, maximum = 128 * 1024 * 1024) {
   const after = await stat(file);
   if (pending.length || after.size !== info.size || after.mtimeMs !== info.mtimeMs) throw Error('history_changing');
 }
+export async function readClaudeHistoryHead(session, { configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude') } = {}) {
+  if (!UUID.test(session.id || '')) return { verified: false, reason: 'invalid_session' };
+  const file = join(resolve(configDir), 'projects', resolve(session.cwd).replace(/[^a-zA-Z0-9]/g, '-'), session.id.toLowerCase() + '.jsonl');
+  let lastInput = null, boundary = null, firstCwd = null, latestAssistant = null;
+  try {
+    await scan(file, record => {
+      if (record?.sessionId?.toLowerCase?.() !== session.id.toLowerCase() || record.isSidechain || record.teamName) return;
+      firstCwd ||= typeof record.cwd === 'string' ? record.cwd : null;
+      if (record.type === 'system' && record.subtype === 'compact_boundary') boundary = { at: record.timestamp, trigger: record.compactMetadata?.trigger || record.compact_metadata?.trigger };
+      if (record.type === 'user' && !record.isCompactSummary && !record.isVisibleInTranscriptOnly) {
+        const blocks = record.message?.content;
+        if (typeof blocks === 'string' || Array.isArray(blocks) && blocks.length && blocks.every(b => ['text','image','document'].includes(b?.type))) {
+          lastInput = { id: record.uuid, at: record.timestamp }; latestAssistant = null;
+        }
+      }
+      if (record.type === 'assistant') latestAssistant = { at: record.timestamp, stopReason: record.message?.stop_reason,
+        id: record.uuid || record.message?.id,
+        quotaError: ['rate_limit', 'rate_limit_error'].includes(record.error) || ['rate_limit', 'rate_limit_error'].includes(record.errorType) };
+    });
+  } catch (error) { return { verified: false, reason: error.message === 'history_changing' ? 'history_changing' : 'history_unavailable' }; }
+  return { verified: UUID.test(lastInput?.id || '') && Boolean(firstCwd), lastInputId: lastInput?.id,
+    lastInputAt: lastInput?.at, cwd: firstCwd, terminal: latestAssistant?.stopReason === 'end_turn',
+    quotaError: latestAssistant?.quotaError === true, lastAssistantId: latestAssistant?.id, boundary, source: 'claude-transcript' };
+}
 // Only selected-session evidence is returned; no chat text, tokens or account data.
 export async function readRestartEvidence(cycle, sample, { root, configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude') } = {}) {
   if (cycle.session.client === 'opencode') {
@@ -62,25 +86,8 @@ export async function readRestartEvidence(cycle, sample, { root, configDir = pro
         && stamp(cycle.compactIntentAt) !== null && stamp(usage.lastCompactionAt) >= stamp(cycle.compactIntentAt),
       source: 'codex-native-head' };
   }
-  if (!UUID.test(cycle.session.id || '')) return { verified: false, reason: 'invalid_session' };
-  const file = join(resolve(configDir), 'projects', resolve(cycle.session.cwd).replace(/[^a-zA-Z0-9]/g, '-'), cycle.session.id.toLowerCase() + '.jsonl');
-  let lastInput = null, boundary = null, firstCwd = null, latestAssistant = null;
-  try {
-    await scan(file, record => {
-      if (record?.sessionId?.toLowerCase?.() !== cycle.session.id.toLowerCase() || record.isSidechain || record.teamName) return;
-      firstCwd ||= typeof record.cwd === 'string' ? record.cwd : null;
-      if (record.type === 'system' && record.subtype === 'compact_boundary') boundary = { at: record.timestamp, trigger: record.compactMetadata?.trigger || record.compact_metadata?.trigger };
-      if (record.type === 'user' && !record.isCompactSummary && !record.isVisibleInTranscriptOnly) {
-        const blocks = record.message?.content;
-        if (typeof blocks === 'string' || Array.isArray(blocks) && blocks.length && blocks.every(b => ['text','image','document'].includes(b?.type))) {
-          lastInput = { id: record.uuid, at: record.timestamp }; latestAssistant = null;
-        }
-      }
-      if (record.type === 'assistant') latestAssistant = { at: record.timestamp, stopReason: record.message?.stop_reason };
-    });
-  } catch (error) { return { verified: false, reason: error.message === 'history_changing' ? 'history_changing' : 'history_unavailable' }; }
-  const result = { verified: UUID.test(lastInput?.id || '') && Boolean(firstCwd), lastInputId: lastInput?.id,
-    lastInputAt: lastInput?.at, cwd: firstCwd, terminal: latestAssistant?.stopReason === 'end_turn', source: 'claude-transcript', compactCompleted: false };
+  const { boundary, ...head } = await readClaudeHistoryHead(cycle.session, { configDir });
+  const result = { ...head, compactCompleted: false }, lastInput = { id: head.lastInputId, at: head.lastInputAt };
   if (!cycle.compactDispatched || !root || !boundary || stamp(cycle.compactIntentAt) === null) return result;
   let requested = null, completed = null, newerControl = false;
   try {
@@ -126,7 +133,7 @@ export function restartPlan(cycle, evidence, { handoff, restored } = {}) {
   if (restoring && !handoff) return fail('交付回执缺失，不能自动恢复。');
   const knownUnsent = !cycle.controlDispatched && !cycle.controlTurnId && (beforeIntent
     || restoring && evidence.compactCompleted
-    || !restoring && evidence.lastInputId === cycle.triggerRuntime.latestTurn?.id);
+    || !restoring && evidence.lastInputId === (cycle.triggerRuntime.latestTurn?.id || cycle.triggerRuntime.lastCompletedTurnId));
   if (!sameControl && !knownUnsent) return fail('重启后检测到维护之外的新输入，需人工核对。');
   const received = restoring ? restored : handoff;
   if (received) return { action: 'resume', stage: restoring ? 'awaiting_restore_end' : 'awaiting_handoff_end', patch: {}, endedControl: true };

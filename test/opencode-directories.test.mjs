@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { randomUUID, randomInt } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import Cooperation from '../plugins/opencode.mjs';
 import { openCodeDirectoryEnabled } from '../src/opencode-directories.mjs';
 import { createOpenCodeAdapter } from '../src/adapters/opencode.mjs';
@@ -19,7 +19,7 @@ async function fixture(t) {
   const claudeId = randomUUID();
   await writeFile(join(configDir, 'sessions', process.pid + '.json'), JSON.stringify({ sessionId: claudeId, pid: process.pid, cwd: b, name: 'Claude fixture' }));
   const adapters = { opencode: createOpenCodeAdapter({ root }), claude: { list: query => listClaudeSessions({ ...query, configDir }) } };
-  const manager = await startServer({ root, port: randomInt(20000, 65000), adapters, startMonitoring: false,
+  const manager = await startServer({ root, port: 0, adapters, startMonitoring: false,
     runtimeFactory: () => ({ status: async () => ({ connected: false, capabilities: {} }), close() {} }) });
   const hooks = [];
   t.after(async () => { for (const hook of hooks) await hook.dispose?.(); await manager.close(); await rm(base, { recursive: true, force: true }); });

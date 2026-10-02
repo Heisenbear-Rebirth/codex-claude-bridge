@@ -109,22 +109,27 @@ test('Codex directory readiness distinguishes a missing message bridge from an u
   assert.equal(directoryConnection({ client: 'codex', bridge: { connected: true } }).label, '已连接');
   assert.equal(directoryConnection({ client: 'codex', directory, sessions: [session], bridge: { connected: true }, online: false }).reason, 'service_offline');
 });
-test('connection help provides scoped manual setup and preserves a running Claude task', () => {
+test('connection help provides everyday actions instead of installation commands and preserves a running Claude task', () => {
   const directory = { id: 'a', path: 'E:/Work/A', recursive: true };
   const install = "E:/Tools/O'Brien Cooperation";
   const guide = connectionGuidance({ client: 'claude', directory, status: { reason: 'claude_access', connected: 0 }, installationDirectory: install });
   assert.equal(guide.scope, directory.path);
-  assert.ok(guide.steps.some(step => step.code?.includes("O''Brien")));
-  assert.ok(guide.steps.some(step => step.text.includes('等当前任务结束后')));
-  assert.ok(guide.note.includes('不会从父目录自动继承'));
+  assert.equal(guide.steps.some(step => step.code), false);
+  assert.equal(guide.primary.action, 'settings');
+  assert.match(guide.note, /分别允许连接/);
   const codex = connectionGuidance({ client: 'codex', directory, status: { reason: 'codex_bridge', connected: 0 }, installationDirectory: install });
-  const code = codex.steps.find(step => step.code).code;
-  assert.ok(code.includes('[mcp_servers.cooperation]'));
-  assert.ok(code.includes('CODEX_APP_TOOLS_PIPE_PATH'));
-  const args = JSON.parse(code.split('\n').find(line => line.startsWith('args = ')).slice(7));
-  assert.deepEqual(args, [install + '/bin/coop.mjs', 'mcp', '--client', 'codex']);
+  assert.equal(codex.steps.some(step => step.code), false);
+  assert.match(codex.summary, /等待 Codex/);
   const ready = connectionGuidance({ client: 'codex', directory, status: { reason: 'codex_session', connected: 0 }, installationDirectory: install });
   assert.equal(ready.steps.some(step => step.code), false);
+  const connected = connectionGuidance({ client: 'claude', directory, status: { reason: 'ready', connected: 2 } });
+  assert.equal(connected.steps.length, 0); assert.equal(connected.primary.action, 'done');
+  const reopen = connectionGuidance({ client: 'claude', directory, status: { reason: 'claude_reopen', connected: 1 } });
+  assert.ok(reopen.steps.some(s => s.text.includes('等当前任务结束后')));
+  for (const client of ['claude', 'codex', 'opencode']) for (const reason of ['ready','checking','no_sessions','claude_access','codex_bridge']) {
+    const text = JSON.stringify(connectionGuidance({ client, directory, status: { reason } }));
+    assert.doesNotMatch(text, /build-claude|claudeProcessWrapper|config\.toml|acceptUserMessages|CODEX_APP_TOOLS_PIPE_PATH/);
+  }
 });
 
 

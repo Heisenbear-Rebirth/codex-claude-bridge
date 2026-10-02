@@ -1,5 +1,71 @@
 # Validation and supported scope
 
+## 2026-10-02 项目重启接续确认
+
+完整测试 **290 项通过**，浏览器 **8 组通过 / 0 页面错误**。实际 wrapper + 隔离管理服务验证两种启动顺序的额度接续和五个维护阶段；确认前无新阶段提交，确认后仍保留回执、未知压缩和未知发送保护。三端队列验证先确认再连接、暂缓、重复重启和旧连接快照不得放行。覆盖服务关闭前、关闭期间和原任务重连后发生额度中断。OpenCode 原生协议验证当前 429 阻止压缩与直接投递，确认不能绕过限流，原会话新轮次恢复后按序投递。
+
+前端验证：三端离线会话、默认焦点“稍后处理”、Esc 和刷新、部分确认、跨标签页、已有页面随服务重启重新确认、过期 boot / CSRF 拒绝及移动端布局。修复了旧轮询结果晚到导致重新显示已处理事项的竞争情况。
+
+证据：`.cooperation/verification/restart-confirmation-full-tests.txt`、`restart-confirmation-browser.json`、`restart-confirmation-deployment.json`。全部隔离进程、数据和浏览器缓存位于项目内；没有重启真实业务客户端或向其注入验证消息。未实测实体电脑断电或真实账户耗尽后的数小时等待。
+
+## Shutdown and startup-order recovery (2026-10-02)
+
+The default full suite passes **275 tests**, with no failures, skips or cancellations. Eleven new regressions first reproduced cancelled quota recovery after native instance changes and stalled maintenance after a manager-only restart. Fixes bind verified failures to new observations, retain uncertain-send holds, persist Claude quota metadata independently of the manager, and repeatedly reconcile the original phase after reconnect.
+
+Isolated tests terminate the actual Windows wrapper executable, reopen its deterministic native child, and restart the management service in both orders. They preserve checkpoint gates and FIFO through writing handoff, awaiting handoff completion, completed compaction, restoring, and awaiting restore completion. A crash after a compact boundary but before its result holds the queue without repeating compaction. Quota failures observed while the manager is absent also survive restart. Actual Codex IPC adapter tests reconnect to a changed deterministic owner and submit one continuation with inherited settings. Same-process manager restarts, settings changes, manual stop, missing history, concurrent input and uncertain dispatch remain covered.
+
+Four browser checks pass with zero page errors: offline waiting, history verification without a live quota marker, changing reasons without an activity change, and mobile layout. No real business client was restarted or messaged, no account quota was exhausted, and no physical power-loss test was performed. Running Claude wrappers load persistence at their next normal restart; missing pre-upgrade evidence requires confirmation.
+
+Evidence: `.cooperation/verification/restart-recovery-full-tests.txt`, `restart-recovery-browser.json`, and `restart-recovery-deployment.json` when deployed. Intermediate logs retain a removed wrapper SQLite-warning dependency and random fixture-port conflicts; HTTP fixtures now use the existing retrying allocator. See [restart behavior](RESTART-RECOVERY.md).
+
+## UI continuity and status-first layout (2026-10-02)
+
+The full regression suite passes **239 tests**, with no failures, skips or cancellations. The published frontend also passes eight browser verification groups with zero page errors.
+
+The Apple-design review reproduced discarded prompt drafts, lost keyboard focus on polling, cleared message-text selections, and quota explanations below the first viewport. The revised interface retains page-local drafts and caret positions, supports undo for reset/discard actions, handles save completion after dialog closure, and reconciles refreshed DOM nodes by stable identity. Current status and required actions now precede context statistics and collapsible thresholds.
+
+An isolated browser exercised the published assets against a real isolated HTTP management service. It verified background status updates and unrelated session discovery during editing, message updates and new arrivals during text selection, Escape/reopen, reset/discard undo, invalid drafts, failed saves, closing during an in-flight save, 44px mobile controls, focus trapping/restoration, rapid drawer reversal, reduced motion, and an actual maintenance action through the test service. Page errors were zero. All browser profiles, caches, temporary files and fixtures stayed inside this repository; copy operations used a page-local clipboard substitute. Mobile verification used a 390px Chrome viewport rather than physical phone hardware.
+
+Evidence: `.cooperation/verification/apple-design-audit.json`, `apple-design-polish-browser.json`, `apple-design-ui-full-tests.txt` and `apple-design-ui-deployment.json`. A full-suite run encountered an unrelated fixed test-port collision; that log is retained as `apple-design-ui-port-collision.txt`, and the affected fixture now uses the existing retrying automatic-port allocator. Publication changes only static frontend assets and preserves saved policies and prompt settings without restarting the service or native clients.
+
+## Quota recovery with folded inputs and mixed native histories (2026-10-02)
+
+The full default test suite passes **239 tests**, with no failures, skips or cancellations. Eight new regressions failed against the preceding implementation before the quota-state fixes. Claude now consumes native command lifecycle evidence instead of promoting local queued inputs into a fictional running turn. Codex orders mixed turn representations using a shared head or native timestamps; an ambiguous head retains quota evidence and blocks native controls until synchronization. Quota polling can proceed while the continuation boundary remains unavailable.
+
+The executable Claude wrapper and isolated management service verified two inputs folded into the same turn, quota failure, read-only quota querying while busy, and one configured continuation in the original process without replaying the folded inputs. The real Codex IPC adapter and deterministic native endpoint verified ambiguous quota detection, polling, synchronization, and exactly one continuation with inherited settings. The browser verified enabled/disabled policy feedback, dated reset information, historical maintenance labeling, client upgrade guidance and the 390px layout, with no page errors.
+
+A reload regression also verifies that a confirmed paused maintenance failure retains its original cause, checkpoint and queued messages. Intermediate full-suite runs exposed Fetch-blocked Windows ephemeral ports and a fixture initialization timeout; their logs were retained. Automatic HTTP allocation for the wrapper and management server now shares the existing OpenCode approach of selecting loopback ports in 20000–65535 with bind retries, without changing system configuration. The final default concurrent suite passed after these changes. Native business sessions were not sent test messages or restarted, and a real account exhaustion/reset cycle was not forced.
+
+Evidence: `.cooperation/verification/quota-state-before.txt`, `quota-state-restart-before.txt`, `quota-state-full-tests.txt`, `quota-state-browser.json`, and the retained `quota-state-intermediate-*.txt` files.
+
+## Reverse peer delivery into quota-limited Codex (2026-10-01)
+
+The full suite passes **225 tests**. Production Codex message delivery now checks the current native state before invoking the App message bridge, so a stale idle snapshot cannot bypass an already observed native quota error. An explicitly unsent delivery remains queued through the same durable deferral path used by Claude.
+
+The reverse-direction regression failed before this guard and passes with it. The isolated test connects the actual Codex IPC adapter to a deterministic native-protocol endpoint and verifies first-message quota detection, two queued followers, no compaction at high context use, one configured native continuation with inherited thread settings, and exactly-once FIFO delivery. It does not exhaust an actual Codex account. Evidence: `.cooperation/verification/codex-peer-quota-before.txt`, `codex-peer-quota-protocol.txt` and `codex-peer-quota-full-tests.txt`.
+
+## Peer delivery into a quota-limited Claude session (2026-10-01)
+
+The full suite passes **224 tests**. Current Cooperation peer-message IDs are registered before native delivery, allowing a peer-triggered quota failure to be associated with the receiving turn even when no IDE input preceded it. Historical peer replay cannot start an observed turn. A final native quota check defers unsent messages back to the durable queue if the monitoring snapshot was stale.
+
+An isolated real wrapper and management service, using a deterministic protocol child in place of the model process, verified a Codex-origin first message triggering Claude's five-hour rejection, two subsequent messages remaining queued, one custom quota-continuation prompt after positive quota availability, and exactly-once FIFO delivery of the waiting messages. The receiving process stayed unchanged. This did not consume or force an actual account quota. Evidence: `.cooperation/verification/peer-quota-native.txt` and `peer-quota-full-tests.txt`.
+
+## Everyday connection guidance and receipt recovery (2026-10-01)
+
+The full suite passes **221 tests**. The regression suite reproduces synthetic Claude messages being treated as a model change, and a ten-minute handoff timeout rejecting receipts while the original control turn remains active. It also verifies safe late-receipt acceptance for Claude and Codex, metadata-only update races, retained user-intervention guards, and rotating credentials on explicit retries.
+
+The real wrapper executable, isolated management HTTP server and deterministic protocol child completed handoff, one compaction, restore and two accepted receipts in the same process. This is a protocol-level acceptance check, not a fault injection into a user's production model session. An isolated browser verified the state-specific command-free connection flow, three-stage maintenance feedback, disclosure controls, diagnostics, cancellation confirmation and desktop/mobile layout. See [implementation and evidence](USER-EXPERIENCE.md).
+
+## Quota interruption and continuation (2026-10-01)
+
+The complete automated suite passes **207 tests**, with no failures, skips or cancellations.
+
+Quota failure is now distinct from idle activity for Codex and Claude. Policy and native control guards block compaction, while a durable continuation record holds queued messages. The manager reads quota without model probes and submits a single continuation only after positive availability and unchanged native identity/settings. Unknown delivery is not retried. Further quota failures back off; disabling automatic management cancels future continuation.
+
+Tests cover both client recovery paths, expired reset timestamps, weekly/model limits, native user/settings races, restart deduplication, unknown delivery, FIFO holds, and failures during maintenance. The executable Claude wrapper test uses a deterministic protocol child to verify `get_usage` with behavior scanning disabled and same-process continuation. An old wrapper cannot perform automatic maintenance until normally reopened with quota support.
+
+The actual Codex App usage endpoint returned public quota windows successfully. An isolated Chrome verified waiting-state display and the new configurable quota prompt on desktop and mobile, with no page errors. No production business session was sent a test prompt, and no real account was exhausted to simulate the five-hour cycle. Real exhaustion-to-restoration acceptance remains unverified. See [quota behavior and evidence](QUOTA-RECOVERY.md).
+
 ## Custom message and maintenance prompts (2026-09-30)
 
 The complete suite passes **189 tests**. Project-local prompt settings are revisioned and atomically saved through a CSRF-protected UI endpoint. Tests verify bounded templates, mandatory runtime checkpoint insertion, restart persistence, stale-write rejection, queued-message affix snapshots, per-stage maintenance customization, OpenCode dynamic affixes and duplicate-delivery handling, and Claude presentation-only labels.

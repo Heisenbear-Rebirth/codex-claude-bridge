@@ -1,21 +1,113 @@
 export const clientName = client => ({ codex: 'Codex', claude: 'Claude', opencode: 'OpenCode' })[client] || client;
 export const addressOf = session => session.client + ':' + (session.client === 'opencode' ? session.id : session.id.toLowerCase());
 export const autoCompressEnabled = policy => policy?.enabled === true && policy?.mode === 'automatic';
+
+const panelAnimations = new Map();
+// Only explicit navigation calls this. Polling must not animate reading content.
+export function revealPanel(element) {
+  if (!element) return;
+  const previous = panelAnimations.get(element), current = previous && getComputedStyle(element);
+  const from = current ? { opacity: current.opacity, transform: current.transform } : null;
+  previous?.cancel(); panelAnimations.delete(element);
+  if (document.documentElement.dataset.motionInput === 'keyboard' || !element.getClientRects().length || !element.animate) return;
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const tokens = getComputedStyle(document.documentElement);
+  const animation = element.animate([
+    reduced ? { opacity: from?.opacity || .65 } : from || { opacity: .65, transform: 'translateY(6px)' },
+    reduced ? { opacity: 1 } : { opacity: 1, transform: 'translateY(0)' },
+  ], { duration: parseFloat(tokens.getPropertyValue(reduced ? '--motion-fade' : '--motion-panel')) || 180,
+    easing: tokens.getPropertyValue('--ease-out').trim() || 'cubic-bezier(0.23, 1, 0.32, 1)' });
+  animation.id = 'cooperation-panel'; panelAnimations.set(element, animation);
+  animation.finished.catch(() => {}).finally(() => { if (panelAnimations.get(element) === animation) panelAnimations.delete(element); });
+}
+
+export function syncTabIndicator({ animate = true } = {}) {
+  const tabs = document.querySelector('.workspace-tabs'), indicator = document.getElementById('workspace-tab-indicator');
+  const selected = tabs?.querySelector('[aria-selected="true"]');
+  if (!indicator || !selected) return;
+  const transform = `translateX(${selected.offsetLeft}px) scaleX(${selected.offsetWidth})`;
+  if (indicator.style.transform === transform) return;
+  if (!animate) indicator.style.transition = 'none';
+  indicator.style.transform = transform; tabs.classList.add('motion-ready');
+  if (!animate) { void indicator.offsetWidth; indicator.style.removeProperty('transition'); }
+}
+
+export function setupMotion() {
+  const html = document.documentElement;
+  html.dataset.motionInput = 'pointer';
+  document.addEventListener('pointerdown', () => { html.dataset.motionInput = 'pointer'; }, { capture: true, passive: true });
+  document.addEventListener('keydown', event => {
+    if (['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) return;
+    html.dataset.motionInput = 'keyboard';
+    for (const animation of panelAnimations.values()) animation.cancel(); panelAnimations.clear();
+  }, { capture: true });
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+  reduced.addEventListener('change', () => { for (const animation of panelAnimations.values()) animation.cancel(); panelAnimations.clear(); });
+  if (typeof ResizeObserver === 'function') {
+    const observer = new ResizeObserver(() => syncTabIndicator({ animate: false }));
+    for (const node of document.querySelectorAll('.workspace-tabs,.workspace-tabs button')) observer.observe(node);
+    window.addEventListener('pagehide', () => observer.disconnect(), { once: true });
+  }
+  syncTabIndicator({ animate: false });
+}
+
+// Keep live DOM nodes while refreshed data changes. In particular, a polling
+// response must not replace the text that someone is selecting or copying.
+export function reconcileChildren(parent, incoming) {
+  const key = node => node.nodeType === 1 ? node.dataset.renderKey || node.dataset.address || node.id || null : null;
+  const focused = parent.contains(document.activeElement) ? document.activeElement : null;
+  const selection = window.getSelection(), selected = selection?.rangeCount && parent.contains(selection.anchorNode) && parent.contains(selection.focusNode)
+    ? { anchor: selection.anchorNode, start: selection.anchorOffset, focus: selection.focusNode, end: selection.focusOffset,
+      anchorText: selection.anchorNode.textContent, focusText: selection.focusNode.textContent } : null;
+  function update(container, incomingNodes) {
+    const desired = [...incomingNodes], previous = [...container.childNodes], used = new Set();
+    const keyed = new Map(previous.filter(key).map(node => [key(node), node]));
+    let cursor = container.firstChild;
+    for (const next of desired) {
+      const id = key(next);
+      let current = id ? keyed.get(id) : previous.find(node => !used.has(node) && !key(node) && node.nodeType === next.nodeType && node.nodeName === next.nodeName);
+      if (!current || current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) current = next;
+      else if (current.nodeType === 3) { if (current.data !== next.data) current.data = next.data; }
+      else if (current.nodeType === 1) {
+        for (const attr of [...current.attributes]) {
+          if (attr.name === 'data-ui-busy' || attr.name === 'open' && current.tagName === 'DETAILS' || attr.name === 'disabled' && current.dataset.uiBusy) continue;
+          if (!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+        }
+        for (const attr of next.attributes) if (!(attr.name === 'disabled' && current.dataset.uiBusy) && current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);
+        current.onclick = next.onclick;
+        update(current, next.childNodes);
+      }
+      used.add(current);
+      if (current !== cursor) container.insertBefore(current, cursor);
+      cursor = current.nextSibling;
+    }
+    for (const node of [...container.childNodes]) if (!used.has(node)) node.remove();
+  }
+  update(parent, incoming);
+  if (focused && document.activeElement !== focused && focused.isConnected) focused.focus({ preventScroll: true });
+  else if (focused && !focused.isConnected && document.activeElement === document.body) {
+    const fallback = parent.querySelector('[role="status"],.cycle-title,button,a[href]');
+    if (fallback) { if (fallback.tabIndex < 0) fallback.tabIndex = -1; fallback.focus({ preventScroll: true }); }
+  }
+  if (selected && (selection.anchorNode !== selected.anchor || selection.anchorOffset !== selected.start || selection.focusNode !== selected.focus || selection.focusOffset !== selected.end)
+    && selected.anchor.isConnected && selected.focus.isConnected && selected.anchor.textContent === selected.anchorText && selected.focus.textContent === selected.focusText)
+    selection.setBaseAndExtent(selected.anchor, selected.start, selected.focus, selected.end);
+}
 export function openCodeContextState(session) {
   if (session.client !== 'opencode') return null;
   const sample = session.monitoring, runtime = sample?.runtime, usage = sample?.usage;
   if (session.missing || runtime?.connected === false) return { label: 'OpenCode 未连接', detail: '等待该会话所属的 OpenCode 后端重新连接。' };
-  if (!runtime) return { label: '等待上下文状态', detail: '正在检查原生 OpenCode 插件的上下文读取能力。' };
+  if (!runtime) return { label: '等待上下文状态', detail: '正在读取这个 OpenCode 会话的状态。' };
   // Legacy bridges explicitly return usage:null and lack passiveUsage. A live
   // message connection alone does not mean the loaded plugin can read usage.
   if (!usage && runtime.connected === true && runtime.capabilities?.passiveUsage !== true)
-    return { label: '插件需要重新加载', detail: '当前 OpenCode 后端仍加载旧版 Cooperation 插件。请在当前任务结束后重启该后端，再打开这个已有会话。刷新管理网页或重启 Cooperation 服务不会重新加载原生插件。' };
-  if (runtime.usageState === 'query_failed') return { label: '上下文读取失败', detail: '原生上下文查询失败。可点击“刷新状态”重试；会话连接仍然有效。' };
-  if (!Number.isFinite(usage?.usedTokens)) return { label: '等待原生回复统计', detail: '插件已支持上下文读取，尚未取得有效的单次回复 token 统计。原生回复记录用量后会自动更新。' };
-  if (!(usage.contextWindowTokens > 0)) return { label: '模型容量未知', detail: '已读取 token 用量，但原生模型目录尚未提供对应模型的上下文容量，暂时无法计算百分比。' };
+    return { label: '插件需要重新加载', detail: '更新尚未在这个会话中生效。等当前任务结束后，重新打开 OpenCode 和原会话。' };
+  if (runtime.usageState === 'query_failed') return { label: '上下文读取失败', detail: '暂时无法读取用量。点击“更新状态”重试；会话仍保持连接。' };
+  if (!Number.isFinite(usage?.usedTokens)) return { label: '等待原生回复统计', detail: '收到这个会话的回复用量后，百分比会自动更新。' };
+  if (!(usage.contextWindowTokens > 0)) return { label: '模型容量未知', detail: '模型尚未提供上下文容量，收到完整统计后会自动显示百分比。' };
   return { label: '上下文已接入', detail: runtime.capabilities?.automaticMaintenance === true
-    ? '支持交付、原生压缩和恢复上下文。开启自动压缩后按本会话阈值执行；有子任务、权限请求或新输入时等待处理。'
-    : runtime.maintenanceError || '当前插件尚未提供维护能力。请在任务结束后加载新版插件，再刷新状态。' };
+    ? '开启自动管理后，会按本会话的设置保存进度、整理上下文并恢复任务。'
+    : '自动维护暂未就绪。请在任务结束后重新打开 OpenCode，使更新生效。' };
 }
 export function projectMembers(project, sessions, mode = 'directories') {
   if (!project) return [];
@@ -83,60 +175,14 @@ export function directoryConnection({ client, directory = null, sessions = [], b
   };
   const connected = members.filter(s => allowed(s) && s.monitoring?.runtime?.connected === true
     && s.monitoring.runtime.controlsEnabled !== false && !stale(s.monitoring)).length;
-  if (connected) return result('connected', '已连接 ' + connected + ' 个', 'ready', connected);
+  if (connected) return result('connected', '已连接 ' + connected + ' 个', client === 'claude' && members.some(s => s.monitoring?.runtime?.requiresReopen) ? 'claude_reopen' : 'ready', connected);
   if (client === 'claude' && !directory?.claudeControlEnabled && !members.some(allowed)) return result('disconnected', '未接入', 'claude_access');
   if (!members.length) return result('disconnected', '未连接', 'no_sessions');
   if (members.every(s => !s.monitoring || stale(s.monitoring))) return result('checking', '待确认', 'checking');
   return result('disconnected', '未连接', client + '_session');
 }
 
-export function connectionGuidance({ client, directory = null, status, installationDirectory = '' }) {
-  const install = installationDirectory.replaceAll('\\', '/').replace(/\/+$/, '');
-  const title = '连接 ' + clientName(client);
-  const scope = directory?.path || 'Codex 消息连接（所有目录共用）';
-  if (status.reason === 'service_offline') return { title, scope, summary: '管理服务当前未连接。', steps: [
-    { title: '启动管理服务', text: '双击 Cooperation 安装目录中的“启动项目.cmd”，再打开它显示的管理页。' },
-    { title: '重新检查', text: '服务恢复后，点击下方“重新检查”。' },
-  ] };
-  if (status.reason === 'directory_error') return { title, scope, summary: '这个目录目前无法访问。', steps: [
-    { title: '确认目录位置', text: '检查目录是否存在，以及所在磁盘或网络位置是否可用；路径已变化时，在左侧重新添加正确目录。' },
-  ] };
-  const count = status.connected ? '已发现 ' + status.total + ' 个会话，其中 ' + status.connected + ' 个已连接。已连接的会话无需重新设置。' : '';
-  if (client === 'opencode') return { title, scope, summary: count || '等待该工作目录原生 OpenCode 后端中的 Cooperation 插件。', steps: [
-    { title: '加载项目插件', text: '首次按 docs/OPENCODE.md 接入 Cooperation 插件。全局接入后，在管理台添加项目目录，保持管理服务运行，再打开该目录的 OpenCode；插件会跟随已添加的目录。已启动的后端需等任务结束后重新打开。' },
-    { title: '确认接收方式', text: 'OpenCode 使用原生 user 消息接收协作内容，需要显式启用 acceptUserMessages。消息保留来源，不授予新的工作权限。' },
-    { title: '使用同一后端', text: '在 TUI 或桌面实际使用的后端加载插件；独立启动的 serve 不代表当前工作会话。完成后点击重新检查。' },
-  ], note: '当前开放通信与活动观察。上下文用量、自动维护和原生界面验收状态见接入文档。' };
-  if (client === 'claude') {
-    const wrapper = install ? install + '/bin/claude-wrapper.exe' : '<Cooperation安装目录>/bin/claude-wrapper.exe';
-    const build = install ? "& '" + (install + '/scripts/build-claude-wrapper.ps1').replaceAll("'", "''") + "'" : '.\\scripts\\build-claude-wrapper.ps1';
-    return { title, scope,
-      summary: count || (status.reason === 'claude_access' ? '尚未允许该工作目录接入 Claude。' : status.reason === 'checking' ? '尚未取得最新连接状态，可以先重新检查。' : '目录已允许接入，但还没有检测到可用的 Claude 会话连接。'),
-      steps: [
-        { title: '首次使用：构建接入程序', text: '在 PowerShell 中运行；已构建且安装位置未变化时可跳过。', code: build, copyLabel: '复制构建命令' },
-        { title: '设置 VS Code', text: '在 VS Code 的用户设置 JSON 中合并这一项，保留其他设置。', code: '"claudeCode.claudeProcessWrapper": ' + JSON.stringify(wrapper), copyLabel: '复制设置项' },
-        { title: '允许工作目录接入', text: '打开目录旁的“项目设置”，开启“Claude 控制接入”。原生会话实际接入后才会显示已连接。' },
-        { title: '重新打开 Claude 面板', text: '在 VS Code 中打开该项目；等当前任务结束后，关闭并重新打开对应 Claude 面板，再点击“重新检查”。' },
-      ], note: directory?.recursive ? '包含子目录时，接入权限按实际工作目录分别设置，不会从父目录自动继承。已连接数量只统计本目录展示范围内的会话。' : '接入与自动压缩是两个独立开关。查看说明和重新检查不会重启会话或修改配置。',
-    };
-  }
-  const config = '[mcp_servers.cooperation]\ncommand = "node"\nargs = ' + JSON.stringify([(install || '<Cooperation安装目录>') + '/bin/coop.mjs', 'mcp', '--client', 'codex'])
-    + '\ntool_timeout_sec = 75\nenv_vars = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_THREAD_ID", "CODEX_MCP_NODE_PATH"]';
-  const bridgeMissing = status.reason === 'codex_bridge';
-  return { title, scope,
-    summary: bridgeMissing ? 'Codex 消息连接尚未就绪。完成一次 MCP 接入后，服务会自动保存并恢复连接。'
-      : count || (directory ? 'Codex 消息连接已就绪；该目录下暂未检测到已打开的原生任务。' : 'Codex 消息连接已就绪。'),
-    steps: [
-      { title: '打开 Codex 桌面 App', text: directory ? '在 Codex 中打开该工作项目，以及希望连接的已有任务。' : '保持 Codex 桌面 App 打开。' },
-      ...(bridgeMissing ? [
-        { title: '首次使用：配置 Cooperation MCP', text: '将下方内容合并到 Codex 用户配置文件 ~/.codex/config.toml；也可放入受信任工作项目的 .codex/config.toml。', code: config, copyLabel: '复制 MCP 配置' },
-        { title: '重新连接 MCP', text: '在 Codex 的 MCP 设置中重新连接 Cooperation。管理服务会自动更新连接，无需反复重启。' },
-      ] : []),
-      { title: '重新检查', text: '等待原生任务初始化完成，再点击下方“重新检查”。' },
-    ], note: '消息连接由各目录共用；每个目录的“已连接”数量只统计其中已接入的原生任务，历史任务不必全部打开。',
-  };
-}
-
+export { connectionGuidance } from './connection-guidance.mjs';
 
 export function sessionConnected(session, options = {}) {
   return directoryConnection({ ...options, client: session.client, sessions: [session] }).connected === 1;

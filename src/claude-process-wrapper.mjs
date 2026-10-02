@@ -9,6 +9,9 @@ import { NativeContextChannel } from './claude-context-channel.mjs';
 import { PeerMessageVisibility } from './claude-peer-visibility.mjs';
 import { claudeDisplayLabel } from './prompt-settings.mjs';
 import { loadPeerHistory } from './claude-peer-history.mjs';
+import { freshAvailableQuota } from './quota-state.mjs';
+import { listenLoopback } from './loopback-server.mjs';
+import { ClaudeQuotaJournal } from './claude-quota-journal.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const normalize = value => resolve(value).replace(/^\\\\\?\\/, '').replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase();
@@ -32,11 +35,13 @@ const child = spawn(binary, args, { cwd: process.cwd(), env: process.env, window
 const resumeAt = args.indexOf('--resume');
 const resumed = resumeAt >= 0 && /^[0-9a-f-]{36}$/i.test(args[resumeAt + 1] || '') ? args[resumeAt + 1].toLowerCase() : null;
 const state = new ClaudeProtocolState(resumed);
+const quotaJournal = enabled ? new ClaudeQuotaJournal({ directory: join(dataDirectory, 'quota-state'), sessionId: resumed, cwd: process.cwd() }) : null;
 const instanceId = randomUUID();
 const token = randomBytes(32).toString('hex');
 const registryFile = join(dataDirectory, 'instances', `${process.pid}-${instanceId}.json`);
 let server, endpoint, pending, closing = false, writing = Promise.resolve(), lastSnapshot = '', lastCompaction = null;
 let controlPending = null, lastControl = null;
+let lastQuotaRead = null;
 const controlOperations = new Map();
 let registryTimer;
 const nativeUiInstanceId = /^[0-9a-f-]{36}$/.test(process.env.COOP_NATIVE_UI_INSTANCE_ID || '') ? process.env.COOP_NATIVE_UI_INSTANCE_ID : null;
@@ -46,12 +51,15 @@ let historyRestoreSession = null;
 const auditFile = join(dataDirectory, 'compactions.jsonl');
 const audit = event => appendFile(auditFile, JSON.stringify({ at: new Date().toISOString(), instanceId, ...event }) + '\n', 'utf8');
 function publicState() { return { ...state.publicState(), wrapperPid: process.pid, childPid: child.pid, instanceId, cwd: process.cwd(),
+  ...(quotaJournal?.pending ? { activity: state.activity() === 'idle' ? 'unknown' : state.activity(),
+    quotaRestart: { pending: true, reason: quotaJournal.reason } } : {}),
   nativeUiInstanceId, nativeLifecycleOperationId,
   protocolVersion: 2, connected: !closing && !state.inputEnded, observedAt: new Date().toISOString(),
   capabilities: { readActivity: true, interrupt: true, sendControl: true, compact: true, observeCompletion: true, passiveUsage: true,
+    quotaRecovery: true, peerQuotaRecovery: true, inputLifecycle: true, restartRecovery: true,
     hardAutomation: false, peerMessageVisibility: enabled && peerMessageVisibility, peerHistoryVisibility: enabled && peerMessageVisibility && peerHistoryVisibility },
   visibilityHistory,
-  canCompact: Boolean(!pending && !controlPending && !contextChannel.active && state.canCompact(inputObserver.atBoundary)),
+  canCompact: Boolean(!quotaJournal?.pending && !pending && !controlPending && !contextChannel.active && state.canCompact(inputObserver.atBoundary)),
   compactionRequestId: pending?.id || null, lastCompaction, controlPending, lastControl }; }
 function persist() {
   if (!enabled || !endpoint || closing) return;
@@ -81,10 +89,11 @@ const inputObserver = new JsonLineObserver(message => {
     const text = typeof content === 'string' ? content : Array.isArray(content) ? content.filter(p => p.type === 'text').map(p => p.text).join('\n') : '';
     nativeLifecycleOperationId = /^\[Cooperation native session:([0-9a-f-]{36})\]\n/.exec(text)?.[1] || null;
   }
-  state.host(message); persist();
+  state.host(message); quotaJournal?.observe(state); persist();
 });
 const outputObserver = new JsonLineObserver(message => {
   state.child(message);
+  quotaJournal?.observe(state);
   if (message.parent_tool_use_id || (message.session_id && state.sessionId !== message.session_id.toLowerCase())) return;
   if (message.type === 'result' && controlPending) {
     lastControl = { ...controlPending, status: state.lastCompletedTurnId === controlPending.requestId ? 'completed' : 'unknown',
@@ -108,7 +117,8 @@ const outputObserver = new JsonLineObserver(message => {
 });
 const startedAt = new Date().toISOString();
 const contextChannel = new NativeContextChannel(bytes => child.stdin.write(bytes), subtype => !pending &&
-  (subtype === 'interrupt' ? state.initialized && state.active && !state.inputEnded && inputObserver.atBoundary : !controlPending && state.canCompact(inputObserver.atBoundary)));
+  (subtype === 'interrupt' ? state.initialized && state.active && !state.inputEnded && inputObserver.atBoundary
+    : !controlPending && (subtype === 'get_usage' ? state.canReadQuota(inputObserver.atBoundary) : state.canCompact(inputObserver.atBoundary))));
 process.stdin.on('data', chunk => { if (enabled) inputObserver.push(chunk); if (!child.stdin.destroyed && !child.stdin.write(chunk)) process.stdin.pause(); });
 child.stdin.on('drain', () => process.stdin.resume());
 process.stdin.on('end', () => { state.inputEnded = true; child.stdin.end(); persist(); });
@@ -177,9 +187,12 @@ async function control(kind, body) {
   const execute = async () => {
     const unchanged = () => state.sessionId === body.sessionId && state.activityRevision === body.expectedActivityRevision
       && (state.activeTurnId ?? null) === (body.expectedTurnId ?? null);
-    const available = () => !pending && !contextChannel.active && inputObserver.atBoundary && !state.inputEnded
+    const available = () => !quotaJournal?.pending && !pending && !contextChannel.active && inputObserver.atBoundary && !state.inputEnded
       && (kind === 'interrupt' ? state.active && Boolean(body.expectedTurnId) && !state.backgroundTasks.size
-        : !controlPending && state.canCompact(inputObserver.atBoundary));
+        : !controlPending && (kind === 'quota-resume'
+          ? state.quota?.autoResume && state.canQuery(inputObserver.atBoundary) && freshAvailableQuota(lastQuotaRead)
+            && lastQuotaRead.activityRevision === state.activityRevision
+          : state.canCompact(inputObserver.atBoundary)));
     if (!unchanged()) return { status: 'state_conflict' };
     if (!available()) return { status: 'busy' };
     await audit({ type: 'control_intent', kind, requestId: body.requestId, sessionId: body.sessionId,
@@ -195,6 +208,7 @@ async function control(kind, body) {
       const frame = { type: 'user', session_id: body.sessionId, uuid: body.requestId, parent_tool_use_id: null,
         message: { role: 'user', content: body.text } };
       state.host(frame);
+      quotaJournal?.observe(state);
       controlPending = { requestId: body.requestId, sessionId: body.sessionId, submittedAt: new Date().toISOString() };
       child.stdin.write(JSON.stringify(frame) + '\n');
       result = { status: 'submitted', ...controlPending, activeTurnId: state.activeTurnId };
@@ -206,7 +220,7 @@ async function control(kind, body) {
   controlOperations.set(body.requestId, { signature, promise }); return promise;
 }
 async function compact(sessionId, requestId) {
-  if (pending || controlPending || contextChannel.active || !state.canCompact(inputObserver.atBoundary)) return { status: 'busy', detail: 'The selected session is not at an idle input boundary.' };
+  if (quotaJournal?.pending || pending || controlPending || contextChannel.active || !state.canCompact(inputObserver.atBoundary)) return { status: 'busy', detail: 'The selected session is not at an idle input boundary.' };
   if (sessionId !== state.sessionId) return { status: 'wrong_session' };
   const sequence = state.userSequence;
   let resolveOperation;
@@ -218,6 +232,7 @@ async function compact(sessionId, requestId) {
     if (sequence !== state.userSequence || !state.canCompact(inputObserver.atBoundary)) { await finishCompaction('busy'); return result; }
     const frame = { type: 'user', session_id: sessionId, uuid: requestId, parent_tool_use_id: null, message: { role: 'user', content: '/compact' } };
     state.host(frame);
+    quotaJournal?.observe(state);
     child.stdin.write(JSON.stringify(frame) + '\n');
     pending.timer = setTimeout(() => {
       if (!pending || pending.id !== requestId) return;
@@ -237,23 +252,43 @@ if (enabled) {
         if (!authorized(request)) return reply(response, 401, { error: 'Unauthorized' });
         const controlsEnabled = await directoryStillEnabled();
         if (request.method === 'GET' && request.url === '/status') {
-          const state = publicState();
-          return reply(response, 200, { ...state, controlsEnabled,
-            capabilities: { ...state.capabilities, automaticMaintenance: controlsEnabled, interrupt: controlsEnabled, sendControl: controlsEnabled, compact: controlsEnabled },
-            canCompact: state.canCompact && controlsEnabled });
+          await quotaJournal?.restore(state);
+          const snapshot = publicState();
+          return reply(response, 200, { ...snapshot, controlsEnabled,
+            capabilities: { ...snapshot.capabilities, automaticMaintenance: controlsEnabled, interrupt: controlsEnabled, sendControl: controlsEnabled, compact: controlsEnabled },
+            canCompact: snapshot.canCompact && controlsEnabled });
         }
         if (!controlsEnabled) return reply(response, 403, { error: 'Control access for this directory is disabled.' });
+        if (request.method === 'POST' && request.url === '/peer-intent') {
+          const body = await readRequest(request);
+          if (Object.keys(body).some(key => !['sessionId', 'instanceId', 'messageId', 'action'].includes(key))
+            || body.sessionId !== state.sessionId || body.instanceId !== instanceId || !/^[0-9a-f-]{36}$/i.test(body.messageId || '')
+            || !['prepare', 'cancel'].includes(body.action)) return reply(response, 400, { error: 'Invalid peer observation request.' });
+          if (body.action === 'cancel') { state.forgetPeer(body.messageId); persist(); return reply(response, 200, { status: 'cancelled' }); }
+          if (quotaJournal?.pending) return reply(response, 200, { status: 'deferred', notSubmitted: true, reason: 'receiver_unavailable', detail: quotaJournal.reason });
+          if (state.quota) return reply(response, 200, { status: 'deferred', notSubmitted: true, runtime: publicState() });
+          state.expectPeer(body.messageId); persist(); return reply(response, 200, { status: 'ready' });
+        }
         if (request.method === 'GET' && request.url.startsWith('/context?')) {
           const query = new URL(request.url, 'http://127.0.0.1');
           if (query.searchParams.get('sessionId') !== state.sessionId) return reply(response, 400, { error: 'Wrong session.' });
           try { const usage = await contextChannel.query(); state.observeNativeUsage(usage); persist(); return reply(response, 200, { sessionId: state.sessionId, instanceId, usage }); }
           catch (error) { return reply(response, 409, { error: error.message }); }
         }
-        if (request.method === 'POST' && ['/interrupt', '/prompt'].includes(request.url)) {
+        if (request.method === 'GET' && request.url.startsWith('/quota?')) {
+          if (new URL(request.url, 'http://127.0.0.1').searchParams.get('sessionId') !== state.sessionId) return reply(response, 409, { error: 'Wrong session.' });
+          const revision = state.activityRevision;
+          try {
+            const quota = await contextChannel.quota();
+            lastQuotaRead = { ...quota, activityRevision: revision };
+            return reply(response, 200, { sessionId: state.sessionId, instanceId, quota });
+          } catch { return reply(response, 409, { error: '原生额度暂不可读取。' }); }
+        }
+        if (request.method === 'POST' && ['/interrupt', '/prompt', '/quota-resume'].includes(request.url)) {
           const body = await readRequest(request);
           if (Object.keys(body).some(key => !['sessionId', 'requestId', 'instanceId', 'expectedTurnId', 'expectedActivityRevision', 'text'].includes(key))
             || body.sessionId !== state.sessionId || body.instanceId !== instanceId || !/^[0-9a-f-]{36}$/i.test(body.requestId || '')
-            || !Number.isInteger(body.expectedActivityRevision) || (request.url === '/prompt' && (typeof body.text !== 'string' || !body.text.trim() || body.text.length > 50000)))
+            || !Number.isInteger(body.expectedActivityRevision) || (request.url !== '/interrupt' && (typeof body.text !== 'string' || !body.text.trim() || body.text.length > 50000)))
             return reply(response, 400, { error: 'Invalid target or control request.' });
           const result = await control(request.url.slice(1), body);
           return reply(response, ['busy', 'state_conflict', 'request_id_conflict'].includes(result.status) ? 409 : 200, result);
@@ -267,7 +302,7 @@ if (enabled) {
       } catch { if (!response.headersSent) reply(response, 500, { error: 'Wrapper request failed.' }); }
     });
     server.requestTimeout = 150000;
-    await new Promise((resolveServer, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolveServer); });
+    await listenLoopback(server);
     endpoint = `http://127.0.0.1:${server.address().port}`; persist();
   } catch { enabled = false; server?.close(); process.stderr.write('[Cooperation] Control endpoint unavailable; normal Claude transport continues.\n'); }
 }

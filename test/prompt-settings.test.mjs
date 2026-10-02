@@ -35,7 +35,7 @@ test('HTTP prompt editing requires CSRF, survives reload, previews only examples
   const delivered = [];
   const adapters = Object.fromEntries(sessions.map(s => [s.client, { find: async id => id === s.id ? s : null, list: async () => ({ sessions: [s] }),
     send: async input => { delivered.push({ client: s.client, ...input }); return { status: 'submitted' }; } }]));
-  let manager = await startServer({ root, port: randomInt(20000, 60000), startMonitoring: false, adapters });
+  let manager = await startServer({ root, port: 0, startMonitoring: false, adapters });
   t.after(async () => { await manager.close(); await rm(root, { recursive: true, force: true }); });
   const config = await (await fetch(manager.url + '/api/config')).json();
   const initial = await (await fetch(manager.url + '/api/prompt-settings')).json();
@@ -59,7 +59,7 @@ test('HTTP prompt editing requires CSRF, survives reload, previews only examples
   assert.ok(delivered.find(x => x.client === 'codex').text.startsWith('codex prefix\n\n'));
   const native = delivered.find(x => x.client === 'opencode');
   assert.ok(native.text.startsWith('发送方：')); assert.deepEqual(native.messageAffixes, { prefix: 'opencode prefix', suffix: 'opencode suffix' });
-  await manager.close(); manager = await startServer({ root, port: randomInt(20000, 60000), startMonitoring: false, adapters });
+  await manager.close(); manager = await startServer({ root, port: 0, startMonitoring: false, adapters });
   assert.deepEqual((await (await fetch(manager.url + '/api/prompt-settings')).json()).values, values);
   assert.equal((await readPromptSettings(root)).revision, 2);
 });

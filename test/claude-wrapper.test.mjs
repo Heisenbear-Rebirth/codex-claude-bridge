@@ -8,6 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { JsonLineObserver, ClaudeProtocolState } from '../src/claude-wrapper-state.mjs';
 import { ClaudeRuntime } from '../src/runtime/claude-runtime.mjs';
+import { startServer } from '../src/http-server.mjs';
+import { PromptSettings } from '../src/prompt-settings.mjs';
+import { defaultPromptValues } from '../public/prompt-templates.mjs';
+import { quotaSettingKey } from '../src/quota-recovery.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = join(root, 'test', 'fixtures', 'claude-wrapper-child.mjs');
@@ -18,13 +22,14 @@ async function until(read, description, timeout = 10000) {
   do { const value = await read(); if (value) return value; await sleep(40); } while (Date.now() < end);
   throw new Error(`Timed out: ${description}`);
 }
-async function harness(t, extraArgs = []) {
+async function harness(t, extraArgs = [], prepare) {
   const parent = join(root, 'verification', 'wrapper-test-temp'); await mkdir(parent, { recursive: true });
   const directory = await mkdtemp(join(parent, 'case-'));
   await writeFile(join(directory, 'config.json'), JSON.stringify({ enabled: true, directories: [directory] }));
   const id = randomUUID();
+  const prepared = await prepare?.({ directory, id });
   const processHandle = spawn(launcher, [process.execPath, fixture, '--input-format', 'stream-json', '--output-format', 'stream-json', '--resume', id, ...extraArgs], {
-    cwd: directory, env: { ...process.env, COOP_WRAPPER_DATA_DIRECTORY: directory }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: directory, env: { ...process.env, COOP_WRAPPER_DATA_DIRECTORY: directory, ...prepared?.env }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const messages = [], stderr = [];
   const exited = new Promise(resolve => processHandle.once('close', code => resolve(code)));
@@ -41,10 +46,12 @@ async function harness(t, extraArgs = []) {
   }
   async function status() { const record = await registry(); if (!record) return null; const result = await fetch(record.endpoint + '/status', { headers: { Authorization: `Bearer ${record.token}` } }); return { record, state: await result.json() }; }
   t.after(async () => { processHandle.stdin.end(); await Promise.race([exited, sleep(3000)]); if (processHandle.exitCode === null) processHandle.kill(); await exited;
+    await prepared?.close?.();
     assert.ok(resolve(directory).startsWith(resolve(parent) + '\\') || resolve(directory).startsWith(resolve(parent) + '/'));
     await rm(directory, { recursive: true, force: true }); });
   send({ type: 'control_request', request_id: 'init-test', request: { subtype: 'initialize' } });
   const ready = await until(async () => { const current = await status(); return current?.state.canCompact ? current : null; }, 'wrapper ready: ' + stderr.join(''));
+  assert.ok(Number(new URL(ready.record.endpoint).port) >= 20000, 'wrapper HTTP uses a Fetch-compatible port');
   async function compact(token = ready.record.token) {
     const current = await status();
     const response = await fetch(current.record.endpoint + '/compact', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -97,6 +104,14 @@ test('pending permission and SDK control requests block compaction', () => {
   state.host({ type: 'control_response', response: { request_id: 'p' } });
   assert.equal(Boolean(state.canCompact()), true);
 });
+
+test('old Claude wrapper is observation-only until it can classify quota interruptions', async () => {
+  const runtime = new ClaudeRuntime(randomUUID()); runtime.record = { instanceId: 'old' };
+  runtime.request = async () => ({ sessionId: runtime.id, instanceId: 'old', activity: 'idle', connected: true, protocolVersion: 2,
+    capabilities: { automaticMaintenance: true, readActivity: true } });
+  const current = await runtime.status(); assert.equal(current.requiresReopen, true); assert.equal(current.capabilities.automaticMaintenance, false);
+  assert.match(current.detail, /重开/);
+});
 test('Windows executable preserves arguments and exit behavior', { skip: process.platform !== 'win32' }, async () => {
   const values = ['space here', '中文🙂', 'quote"inside', 'trailing\\', '', '{"path":"C:\\a b\\"}'];
   const child = spawn(launcher, [process.execPath, fixture, '--show-args', ...values], { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -147,6 +162,68 @@ test('native context query stays read-only and its reply does not enter the IDE 
   assert.equal((await h.status()).state.canCompact, true);
   h.send({ type: 'user', session_id: h.id, message: { role: 'user', content: 'after-context-query' } });
   await until(() => h.messages.some(message => message.fixtureReceivedExactly), 'normal input after context query');
+});
+
+test('quota-limited native wrapper blocks compact and ordinary prompts, queries only quota, resumes once in the original process', async t => {
+  const h = await harness(t), runtime = new ClaudeRuntime(h.id, { folder: join(h.directory, 'instances') });
+  const before = await runtime.status(), failedId = randomUUID();
+  h.send({ type: 'user', uuid: failedId, session_id: h.id, message: { role: 'user', content: 'quota-failure' } });
+  const limited = await until(async () => { const s = await runtime.status(); return s.activity === 'quota_limited' ? s : null; }, 'quota failure observed');
+  assert.equal(limited.quota.turnId, failedId); assert.equal(limited.canCompact, false);
+  assert.equal((await h.compact()).body.status, 'busy'); assert.equal((await h.control('prompt', { text: 'blocked' })).body.status, 'busy');
+  assert.equal((await runtime.resumeQuota('continue', limited, { requestId: randomUUID() })).status, 'busy');
+  const quota = await runtime.quota(); assert.equal(quota.status, 'available');
+  assert.equal(JSON.stringify(quota).includes('not-returned'), false);
+  assert.ok(h.messages.some(m => m.type === 'fixture_quota_request' && m.skipBehaviors === true));
+  assert.equal(h.messages.some(m => m.response?.request_id?.startsWith('cooperation-context-')), false);
+  const requestId = randomUUID(), sent = await runtime.resumeQuota('continue', limited, { requestId, quota });
+  assert.equal(sent.status, 'submitted');
+  await until(async () => (await runtime.status()).lastCompletedTurnId === requestId, 'continued turn finished');
+  assert.equal((await runtime.status()).childPid, before.childPid);
+  const repeat = await h.control('quota-resume', { requestId, text: 'continue', expectedTurnId: limited.activeTurnId, expectedActivityRevision: limited.activityRevision });
+  assert.equal(repeat.body.status, 'submitted');
+  assert.equal(h.messages.filter(m => m.fixtureReceivedExactly && m.uuid === requestId).length, 1);
+});
+test('folded native inputs do not strand Claude quota recovery; actual wrapper and manager continue once in the same process', async t => {
+  let manager, target;
+  const h = await harness(t, [], async ({ directory, id }) => {
+    target = { client: 'claude', id, cwd: directory, name: 'folded quota fixture' };
+    const adapters = Object.fromEntries(['codex', 'claude', 'opencode'].map(client => [client, {
+      list: async () => ({ sessions: client === 'claude' ? [target] : [] }), find: async value => value === id ? target : null,
+    }]));
+    manager = await startServer({ root: directory, port: 0, startMonitoring: false, adapters,
+      runtimeFactory: () => new ClaudeRuntime(id, { folder: join(directory, 'instances') }) });
+    await writeFile(join(directory, 'quota-utilization.json'), JSON.stringify({ value: 100 }));
+    return { close: () => manager.close() };
+  });
+  manager.store.savePolicy(target, { enabled: true, mode: 'automatic' });
+  const values = defaultPromptValues(); values.maintenance.quotaContinue = '从未完成的任务接续，已收到的追加输入不重复发送。';
+  await new PromptSettings(h.directory).save(values, 0);
+  const original = (await h.status()).state, originalId = randomUUID();
+  h.send({ type: 'user', session_id: h.id, uuid: originalId, message: { role: 'user', content: 'hold' } });
+  await until(async () => (await h.status()).state.activeTurnId === originalId, 'original native turn started');
+  const busyQuota = await manager.monitor.runtime(target).quota(); assert.equal(busyQuota.status, 'exhausted');
+  assert.equal((await h.status()).state.activeTurnId, originalId);
+  for (let i = 0; i < 2; i++) h.send({ type: 'user', session_id: h.id, uuid: randomUUID(), message: { role: 'user', content: 'fold-into-current-turn' } });
+  await until(() => h.messages.filter(m => m.type === 'command_lifecycle' && m.state === 'started').length === 2, 'both additional inputs consumed');
+  h.send({ type: 'fixture_finish_folded_quota' });
+  const limited = await until(async () => { const s = (await h.status()).state; return s.activity === 'quota_limited' ? s : null; }, 'quota failure has no phantom turn');
+  assert.equal(limited.activeTurnId, null); assert.equal(limited.queuedNativeInputs, 0); assert.equal(limited.quota.turnId, originalId);
+  await manager.controller.tick(); assert.equal(manager.store.getSetting(quotaSettingKey(target)).state, 'waiting');
+  assert.equal(manager.store.activeCycle(target), null);
+  await writeFile(join(h.directory, 'quota-utilization.json'), JSON.stringify({ value: 5 }));
+  await until(async () => {
+    const record = manager.store.getSetting(quotaSettingKey(target));
+    if (record.state === 'submitted') return true;
+    assert.equal(record.state, 'waiting', JSON.stringify(record));
+    manager.store.setSetting(quotaSettingKey(target), { ...record, nextCheckAt: '2000-01-01T00:00:00Z' });
+    await manager.controller.tick(); return manager.store.getSetting(quotaSettingKey(target)).state === 'submitted';
+  }, 'native quota polling confirms availability and submits once');
+  await until(async () => (await h.status()).state.activity === 'idle', 'quota continuation finished');
+  await manager.controller.tick();
+  assert.equal(h.messages.filter(m => m.fixtureReceivedExactly && m.message?.content === values.maintenance.quotaContinue).length, 1);
+  assert.equal(h.messages.filter(m => m.fixtureReceivedExactly && m.message?.content === 'fold-into-current-turn').length, 2);
+  assert.equal((await h.status()).state.childPid, original.childPid);
 });
 test('revoking a project control directory leaves native traffic intact and closes external operations', { skip: process.platform !== 'win32' }, async t => {
   const h = await harness(t); await writeFile(join(h.directory, 'config.json'), JSON.stringify({ enabled: true, directories: [] }));
@@ -201,4 +278,108 @@ test('passive capacity remains unknown for a new model and ignores subagent usag
   s.child({ type: 'result', modelUsage: { second: { contextWindow: 1000, inputTokens: 9999999 } } });
   assert.equal(s.usage.usedPercent, 6); assert.equal(s.usage.usedTokens, 60);
   s.child({ type: 'system', subtype: 'compact_boundary' }); assert.equal(s.usage, null); assert.equal(s.contextEpoch, 1);
+});
+
+test('Claude synthetic service messages cannot change the selected model or replace real context usage', () => {
+  const s = new ClaudeProtocolState(randomUUID());
+  s.child({ type: 'system', subtype: 'init', model: 'claude-real-model' });
+  s.observeApiUsage('claude-real-model', { input_tokens: 100, cache_creation_input_tokens: 20, cache_read_input_tokens: 400 });
+  const before = structuredClone(s.usage);
+  s.child({ type: 'assistant', message: { model: '<synthetic>', usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } });
+  assert.equal(s.model, 'claude-real-model'); assert.deepEqual(s.usage, before);
+});
+
+test('Claude session selection stays distinct from per-response model metadata and tracks acknowledged user changes', () => {
+  const s = new ClaudeProtocolState(randomUUID()); s.child({ type: 'system', subtype: 'init', model: 'chosen-model' });
+  const usage = { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+  s.observeApiUsage('operation-model', usage); assert.equal(s.model, 'chosen-model'); assert.equal(s.usage.model, 'operation-model');
+  s.host({ type: 'control_request', request_id: 'model-choice', request: { subtype: 'set_model', model: 'new-choice' } });
+  assert.equal(s.model, 'chosen-model');
+  s.child({ type: 'control_response', response: { request_id: 'model-choice', subtype: 'success' } });
+  assert.equal(s.model, 'new-choice');
+  s.observeApiUsage('resolved-api-model', usage); assert.equal(s.model, 'new-choice');
+});
+
+test('real wrapper and manager accept long-running handoff plus synthetic notices, then compact and restore once with both receipts', async t => {
+  let manager, target;
+  const h = await harness(t, [], async ({ directory, id }) => {
+    target = { client: 'claude', id, cwd: directory, name: 'isolated maintenance fixture' };
+    const adapters = Object.fromEntries(['codex', 'claude', 'opencode'].map(client => [client, { list: async () => ({ sessions: client === 'claude' ? [target] : [] }), find: async value => value === id ? target : null }]));
+    manager = await startServer({ root: directory, port: 0, startMonitoring: false, adapters,
+      runtimeFactory: () => new ClaudeRuntime(id, { folder: join(directory, 'instances') }) });
+    return { env: { COOP_FIXTURE_MANAGER_PATH: join(directory, '.cooperation', 'connection.json') }, close: () => manager.close() };
+  });
+  const original = (await h.status()).state;
+  const policy = manager.store.savePolicy(target, { enabled: true, mode: 'automatic' });
+  const sample = await manager.monitor.sample(target, { native: true }); sample.decision = { trigger: 'soft', wasWorkingAtTrigger: false };
+  const cycle = await manager.controller.trigger(target, policy, sample);
+  await until(() => h.messages.some(m => m.type === 'fixture_pending_checkpoint' && m.stage === 'handoff'), 'native handoff requested');
+  manager.store.updateCycle(cycle.id, 'writing_handoff', { deadlineAt: '2000-01-01T00:00:00Z' });
+  await manager.controller.advance(cycle.id); assert.equal(manager.store.cycle(cycle.id).state, 'writing_handoff');
+  assert.equal((await h.status()).state.model, 'fixture'); h.send({ type: 'fixture_release_checkpoint' });
+  await until(async () => manager.store.checkpoint(cycle.id, 'handoff') && (await h.status()).state.activity === 'idle', 'real handoff receipt accepted');
+  await manager.controller.advance(cycle.id); await manager.controller.advance(cycle.id); await manager.controller.advance(cycle.id); await manager.controller.advance(cycle.id);
+  await until(() => h.messages.some(m => m.type === 'fixture_pending_checkpoint' && m.stage === 'restored'), 'native restore requested');
+  h.send({ type: 'fixture_release_checkpoint' });
+  await until(async () => manager.store.checkpoint(cycle.id, 'restored') && (await h.status()).state.activity === 'idle', 'real restored receipt accepted');
+  await manager.controller.advance(cycle.id);
+  assert.equal(manager.store.cycle(cycle.id).state, 'completed');
+  assert.deepEqual(h.messages.filter(m => m.type === 'fixture_receipt').map(m => [m.stage, m.status]), [['handoff', 'accepted'], ['restored', 'accepted']]);
+  assert.equal(h.messages.filter(m => m.fixtureReceivedExactly && m.message?.content === '/compact').length, 1);
+  assert.equal((await h.status()).state.childPid, original.childPid);
+});
+
+test('Codex peer wakes a quota-limited Claude; later messages stay queued and configured continuation is sent once before FIFO release', async t => {
+  let manager, target, sender, nativeInput; const delivered = [];
+  const h = await harness(t, [], async ({ directory, id }) => {
+    target = { client: 'claude', id, cwd: directory, name: 'receiver' };
+    sender = { client: 'codex', id: randomUUID(), cwd: directory, name: 'sender with available quota' };
+    const makeRuntime = () => {
+      const runtime = new ClaudeRuntime(id, { folder: join(directory, 'instances') });
+      runtime.sendPeer = async input => {
+        delivered.push(input); nativeInput({ type: 'fixture_peer_delivery', uuid: input.messageId, text: input.text });
+        return { status: 'submitted' };
+      }; return runtime;
+    };
+    const adapters = {
+      codex: { list: async () => ({ sessions: [] }), find: async value => value === sender.id ? sender : null },
+      claude: { list: async () => ({ sessions: [target] }), find: async value => value === id ? target : null,
+        send: async input => makeRuntime().sendMessage(input.text, { requestId: input.messageId }) },
+      opencode: { list: async () => ({ sessions: [] }), find: async () => null },
+    };
+    manager = await startServer({ root: directory, port: 0, startMonitoring: false, adapters, runtimeFactory: makeRuntime });
+    await writeFile(join(directory, 'quota-utilization.json'), JSON.stringify({ value: 100 }));
+    return { env: { COOP_FIXTURE_MANAGER_PATH: join(directory, '.cooperation', 'connection.json') }, close: () => manager.close() };
+  });
+  nativeInput = h.send;
+  const before = (await h.status()).state;
+  manager.store.savePolicy(target, { enabled: true, mode: 'automatic' });
+  const values = defaultPromptValues(); values.maintenance.quotaContinue = '使用我保存的提示词继续处理原任务和待处理消息。';
+  await new PromptSettings(h.directory).save(values, 0);
+  await manager.monitor.sample(target, { native: true });
+  const first = await manager.service.send({ from: sender, to: 'claude:' + target.id, message: 'first peer message' });
+  assert.equal(first.status, 'submitted');
+  const limited = await until(async () => { const s = (await h.status()).state; return s.quota?.kind === 'five_hour' ? s : null; }, 'first peer detects subscription quota');
+  assert.equal(limited.quota.autoResume, true); assert.equal(limited.quota.turnId, first.messageId);
+  // The management snapshot is still idle here. The final native check must
+  // defer this delivery without losing or misreporting it as sent.
+  const second = await manager.service.send({ from: sender, to: 'claude:' + target.id, message: 'second peer message' });
+  const third = await manager.service.send({ from: sender, to: 'claude:' + target.id, message: 'third peer message' });
+  assert.equal(second.status, 'queued'); assert.equal(third.status, 'queued'); assert.equal(delivered.length, 1);
+  await manager.controller.tick(); assert.equal(manager.store.getSetting(quotaSettingKey(target)).state, 'waiting');
+  assert.equal(h.messages.filter(m => m.fixtureReceivedExactly && m.message?.content === values.maintenance.quotaContinue).length, 0);
+  await writeFile(join(h.directory, 'quota-utilization.json'), JSON.stringify({ value: 5 }));
+  const waiting = manager.store.getSetting(quotaSettingKey(target));
+  manager.store.setSetting(quotaSettingKey(target), { ...waiting, nextCheckAt: '2000-01-01T00:00:00Z' });
+  await manager.controller.tick();
+  await until(async () => (await h.status()).state.lastControl?.status === 'completed', 'configured continuation completed');
+  assert.equal(manager.store.getSetting(quotaSettingKey(target)).state, 'submitted');
+  await manager.monitor.sample(target, { native: true }); await manager.service.mailbox.flush();
+  assert.deepEqual(delivered.map(m => m.messageId), [first.messageId, second.messageId, third.messageId]);
+  assert.equal(manager.store.getMessage(second.messageId).status, 'submitted'); assert.equal(manager.store.getMessage(third.messageId).status, 'submitted');
+  await until(async () => (await h.status()).state.activity === 'idle', 'queued peer messages processed');
+  await manager.controller.tick(); await manager.service.mailbox.flush();
+  assert.equal(h.messages.filter(m => m.fixtureReceivedExactly && m.message?.content === values.maintenance.quotaContinue).length, 1);
+  assert.equal(delivered.length, 3); assert.equal((await h.status()).state.childPid, before.childPid);
+  assert.equal(manager.store.activeCycle(target), null);
 });

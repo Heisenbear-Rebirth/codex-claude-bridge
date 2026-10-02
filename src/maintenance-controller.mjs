@@ -3,7 +3,7 @@ import { join, relative, isAbsolute } from 'node:path';
 import { readFile, realpath } from 'node:fs/promises';
 import { samePermissionSelection } from './runtime/codex-runtime.mjs';
 import { publicSession } from './address.mjs';
-import { receiptHash } from './checkpoint-service.mjs';
+import { receiptHash, recoverableReceiptPause } from './checkpoint-service.mjs';
 import { sessionKey } from './management-store.mjs';
 import { handoffPrompt, restorePrompt, continuePrompt } from './maintenance-prompts.mjs';
 import { maintenanceStage, restartCandidate, restartPlan, readRestartEvidence, controlTurnEnded } from './maintenance-recovery.mjs';
@@ -11,11 +11,15 @@ import { normalizeDirectory } from './directory-service.mjs';
 import { readAccessPolicy } from './access-policy.mjs';
 import { nativeMessageId } from './opencode-bridge.mjs';
 import { readPromptSettings } from './prompt-settings.mjs';
+import { QuotaRecovery } from './quota-recovery.mjs';
+import { modelChanged } from './model-identity.mjs';
 
 const terminal = new Set(['completed', 'cancelled', 'needs_attention', 'user_intervened']);
 const active = s => ['running', 'waiting_permission', 'waiting_input'].includes(s.activity);
 const deadline = ms => new Date(Date.now() + ms).toISOString();
 const stageTimeout = { interrupting: 30000, writing_handoff: 10 * 60_000, awaiting_handoff_end: 60000, compacting: 5 * 60_000, restoring: 5 * 60_000, awaiting_restore_end: 60000 };
+const missingSelection = (before, after) => ['model', 'effort', 'permissionMode', 'permissionFingerprint', 'agent']
+  .some(key => before[key] != null && after[key] == null);
 
 function completedClaudeCompaction(cycle, runtime) {
   const requestId = cycle.compactResult?.requestId;
@@ -36,12 +40,13 @@ export class MaintenanceController {
     this.root = root; this.store = store; this.service = service; this.monitor = monitor; this.onUpdate = onUpdate;
     this.recoveryEvidence = recoveryEvidence; this.recoveryPollAt = new Map();
     this.intervalMs = intervalMs; this.running = new Map(); this.closed = false;
+    this.quotaRecovery = new QuotaRecovery({ root, store, service, monitor, onUpdate });
   }
   start() {
     if (!this.timer) {
       this.timer = setInterval(() => { if (!this.closed && !this.ticking) this.tickPromise = this.tick().catch(error => this.store.event('manager_error', { error: error.message })); }, this.intervalMs); this.timer.unref();
-      this.recoveryPromise = Promise.allSettled(this.store.activeCycles().filter(c => c.state === 'needs_attention' && c.reason?.startsWith('服务重启'))
-        .map(c => this.reconcile(c.id).catch(() => {})));
+      // Recovery uses the same per-cycle lock and repeated polling as normal
+      // advancement. A client may appear long after the service starts.
     }
   }
   async tick() {
@@ -53,14 +58,19 @@ export class MaintenanceController {
       const cycles = this.store.activeCycles().filter(c => access.permits(c.session.cwd));
       for (const cycle of cycles.filter(c => !terminal.has(c.state) || restartCandidate(c))) void this.advance(cycle.id);
       const observed = this.monitor.observeAll ? await this.monitor.observeAll() : null;
-      await Promise.allSettled(this.store.policies().filter(p => p.enabled).map(async policy => {
+      await Promise.allSettled(this.store.policies().map(async policy => {
         if (this.closed) return;
         const session = policy.session;
         if (session.cwd && !access.permits(session.cwd)) return;
         if (this.store.activeCycle(session)) return;
+        if (!policy.enabled) {
+          await this.quotaRecovery.handle(session, policy, this.store.getSnapshot(session) || { runtime: {} }); return;
+        }
         const sample = observed?.get(sessionKey(session)) || await this.monitor.sample(session);
         const latestPolicy = this.store.getPolicy(session);
-        if (!latestPolicy?.enabled || latestPolicy.mode !== 'automatic' || latestPolicy.revision !== policy.revision) return;
+        if (!latestPolicy || latestPolicy.revision !== policy.revision) return;
+        if (await this.quotaRecovery.handle(session, latestPolicy, sample)) return;
+        if (!latestPolicy.enabled || latestPolicy.mode !== 'automatic') return;
         if (policy.mode === 'automatic' && sample.decision.action === 'trigger') {
           try { await this.trigger(session, policy, sample); }
           catch (e) { this.store.saveSnapshot(session, { ...sample, decision: { action: 'attention', reason: e.message } }); this.onUpdate(session); }
@@ -70,8 +80,10 @@ export class MaintenanceController {
     } finally { this.ticking = false; }
   }
   async trigger(session, policy, sample) {
+    this.store.restartConfirmation?.assertAllowed(session);
     if (!['codex', 'claude', 'opencode'].includes(session.client)) throw new Error('此客户端的自动维护尚未开放。');
     const runtime = sample.runtime;
+    if (runtime.quota || runtime.activity === 'quota_limited') throw new Error('额度不足中断期间不进行上下文压缩。');
     if (runtime.capabilities?.automaticMaintenance === false) throw new Error('此客户端的原生控制尚待本机验收，目前仅开放观察模式。');
     const required = ['readActivity', 'sendControl', 'compact', 'observeCompletion', ...(sample.decision.wasWorkingAtTrigger ? ['interrupt'] : [])];
     if (!required.every(c => runtime.capabilities?.[c])) throw new Error('目标客户端的维护能力尚未就绪。');
@@ -84,6 +96,7 @@ export class MaintenanceController {
     const id = randomUUID(), stageTokens = { handoff: randomBytes(24).toString('base64url'), restored: randomBytes(24).toString('base64url') };
     const state = sample.decision.wasWorkingAtTrigger ? 'interrupting' : 'writing_handoff';
     const cycle = this.store.transaction(() => {
+      this.store.restartConfirmation?.assertAllowed(session);
       const created = this.store.createCycle({ id, session: target, state, trigger: sample.decision.trigger,
         policy, wasWorkingAtTrigger: sample.decision.wasWorkingAtTrigger, triggerRuntime: runtime, triggerUsage: sample.usage,
         originalTurnId: runtime.activeTurnId, contextEpoch: sample.usage.contextEpoch,
@@ -119,6 +132,7 @@ export class MaintenanceController {
   async recoverClient(cycle, sample) {
     const runtime = sample.runtime;
     if (runtime.activity !== 'idle') { this.waitForClient(cycle, '客户端已重连，等待当前轮次结束后核对接续。'); return; }
+    if (missingSelection(cycle.triggerRuntime, runtime)) { this.waitForClient(cycle, '等待客户端同步原模型、思考强度和权限选项，再核对接续。'); return; }
     const blocked = reason => {
       const current = this.store.cycle(cycle.id);
       if (current?.revision !== cycle.revision) return;
@@ -134,7 +148,7 @@ export class MaintenanceController {
       return blocked('重连后仍有原生队列、目标、权限请求或后台工作，需人工核对。');
     for (const field of ['model', 'effort', 'permissionMode', 'agent']) {
       const current = field === 'model' ? runtime.model || sample.usage?.model : runtime[field];
-      if (cycle.triggerRuntime[field] != null && current != null && current !== cycle.triggerRuntime[field])
+      if (field === 'model' ? modelChanged(cycle.triggerRuntime.model, current) : cycle.triggerRuntime[field] != null && current != null && current !== cycle.triggerRuntime[field])
         return blocked('重连后的模型、思考强度或权限选项已改变，需人工核对。');
     }
     if (!samePermissionSelection(cycle.triggerRuntime, runtime)) return blocked('重连后的原生权限选项已改变，需人工核对。');
@@ -164,7 +178,50 @@ export class MaintenanceController {
       triggerRuntime: { ...cycle.triggerRuntime, instanceId: runtime.instanceId },
       recoveryBoundary: plan.endedControl ? { instanceId: runtime.instanceId, activityRevision: runtime.activityRevision, controlTurnId: cycle.controlTurnId } : null,
       recoveryCount: (cycle.recoveryCount || 0) + Number(changed), recoveryBlocked: false, disconnectedAt: null, reason: null,
-      reconnectedAt: new Date().toISOString() });
+      serviceRestartPending: false, reconnectedAt: new Date().toISOString() });
+  }
+  async recoverService(cycle, sample) {
+    const runtime = sample.runtime, stage = maintenanceStage(cycle);
+    if (missingSelection(cycle.triggerRuntime, runtime)) { this.waitForClient(cycle, '等待客户端同步原模型、思考强度和权限选项，再核对接续。'); return; }
+    if (modelChanged(cycle.triggerRuntime.model, runtime.model) || !samePermissionSelection(cycle.triggerRuntime, runtime)
+      || ['effort', 'permissionMode', 'agent'].some(key => cycle.triggerRuntime[key] != null && runtime[key] != null && cycle.triggerRuntime[key] !== runtime[key])) {
+      this.store.updateCycle(cycle.id, 'needs_attention', { previousState: stage, recoveryBlocked: true,
+        reason: '重连后的模型、思考强度或权限选项已改变，需人工核对。' }); return;
+    }
+    if (runtime.queuedNativeInputs || runtime.backgroundTasks || runtime.subagentHistoryPresent || runtime.goalStatus === 'active'
+      || runtime.unconfirmedSubmissions || runtime.capabilities?.automaticMaintenance === false) return;
+    if (active(runtime)) {
+      const expected = stage === 'interrupting' ? cycle.originalTurnId : cycle.controlTurnId;
+      if (runtime.activeTurnId !== expected || !expected) return;
+      this.transition(cycle, stage, { serviceRestartPending: false, reason: null }); return;
+    }
+    if (runtime.activity !== 'idle') return;
+    const head = runtime.latestTurn?.id || runtime.lastCompletedTurnId;
+    // Reuse only confirmed native state. A service restart never authorizes a
+    // duplicate prompt to the still-live instance when its receipt is missing.
+    if (['writing_handoff', 'restoring'].includes(stage) && cycle.controlDispatched) {
+      cycle = this.store.updateCycle(cycle.id, cycle.state, { serviceRestartPending: false });
+      this.attention(cycle, '目标轮次已结束，但系统未收到阶段回执。请核对后重发当前阶段。', 'failed'); return;
+    }
+    const evidence = { verified: Boolean(head), lastInputId: head, source: 'same-instance-native-head',
+      compactCompleted: cycle.session.client === 'claude' ? Boolean(completedClaudeCompaction(cycle, runtime))
+        : cycle.session.client === 'opencode' ? Boolean(completedOpenCodeCompaction(cycle, runtime))
+        : (await this.recoveryEvidence(cycle, sample, { root: this.root })).compactCompleted };
+    const plan = restartPlan(cycle, evidence, { handoff: this.store.checkpoint(cycle.id, 'handoff'), restored: this.store.checkpoint(cycle.id, 'restored') });
+    if (plan.action === 'wait') return;
+    if (plan.action === 'attention') {
+      this.store.updateCycle(cycle.id, 'needs_attention', { previousState: stage, recoveryBlocked: true, reason: plan.reason }); return;
+    }
+    if (cycle.documentHash) {
+      try {
+        const allowed = await realpath(cycle.session.cwd), file = await realpath(cycle.handoffPath), rel = relative(allowed, file);
+        if (!rel || rel.startsWith('..') || isAbsolute(rel) || createHash('sha256').update(await readFile(file)).digest('hex') !== cycle.documentHash) throw Error('changed');
+      } catch { this.store.updateCycle(cycle.id, 'needs_attention', { previousState: stage, recoveryBlocked: true, reason: '交付文档位置或内容已经变化，未自动接续。' }); return; }
+    }
+    const now = await this.monitor.runtime(cycle.session).status(), current = this.store.cycle(cycle.id);
+    if (this.closed || current?.revision !== cycle.revision || now.instanceId !== runtime.instanceId
+      || now.activityRevision !== runtime.activityRevision || now.activity !== 'idle') return;
+    this.transition(cycle, plan.stage, { ...plan.patch, serviceRestartPending: false, reason: null });
   }
   async step(id) {
     let cycle = this.store.cycle(id);
@@ -179,6 +236,16 @@ export class MaintenanceController {
     cycle = this.store.cycle(id);
     if (!cycle || terminal.has(cycle.state) && !restartCandidate(cycle)) return;
     const state = sample.runtime;
+    if (this.store.restartConfirmation?.blocks(cycle.session)) return;
+    if (state.requiresReopen) {
+      this.store.updateCycle(id, 'needs_attention', { previousState: maintenanceStage(cycle), recoveryBlocked: true, reason: state.detail });
+      this.onUpdate(cycle.session); return;
+    }
+    if (state.quota || state.activity === 'quota_limited') {
+      this.store.updateCycle(id, 'needs_attention', { previousState: maintenanceStage(cycle), recoveryBlocked: true,
+        reason: '维护阶段因额度不足中断，已保留会话锁及排队消息；额度恢复后请核对当前阶段再继续。' });
+      this.onUpdate(cycle.session); return;
+    }
     if (!state.connected || ['offline','unloaded','initializing'].includes(state.activity)) { this.waitForClient(cycle); return; }
     if (state.activity === 'unknown') {
       if (cycle.state !== 'waiting_client' && Date.now() > Date.parse(cycle.deadlineAt)) this.attention(cycle, '维护阶段超时；会话锁及排队消息已保留。');
@@ -186,16 +253,24 @@ export class MaintenanceController {
     }
     const adapter = this.monitor.runtime(cycle.session);
     if (cycle.triggerRuntime.instanceId !== state.instanceId) { await this.recoverClient(cycle, sample); return; }
+    if (cycle.serviceRestartPending) { await this.recoverService(cycle, sample); return; }
     if (restartCandidate(cycle)) return; // Same live instance is not permission to resend a failed prompt.
     if (cycle.state === 'waiting_client') {
       // A transient disconnect from the same process needs no rebind or replay.
       this.transition(cycle, cycle.previousState, { reason: null, disconnectedAt: null,
         deadlineAt: deadline(cycle.remainingStageMs || stageTimeout[cycle.previousState] || 60000) }); return;
     }
-    if (Date.now() > Date.parse(cycle.deadlineAt)) return this.attention(cycle, '维护阶段超时；会话锁及排队消息已保留。');
+    if (Date.now() > Date.parse(cycle.deadlineAt)) {
+      const stillWorking = ['writing_handoff', 'restoring', 'awaiting_handoff_end', 'awaiting_restore_end'].includes(cycle.state)
+        && cycle.controlDispatched && cycle.controlTurnId && active(state) && state.activeTurnId === cycle.controlTurnId;
+      if (!stillWorking) return this.attention(cycle, '维护阶段超时；会话锁及排队消息已保留。');
+      // A live original control turn can take longer than an arbitrary wall-clock
+      // budget. Keep its receipt gate open, including native permission waits.
+      cycle = this.store.updateCycle(id, cycle.state, { deadlineAt: deadline(60000), lastControlObservedAt: new Date().toISOString() });
+    }
     if (cycle.session.client === 'opencode' && (!state.capabilities?.automaticMaintenance || state.reverted)) return this.attention(cycle, '原生维护状态无法确认或会话已回滚。');
     if (state.queuedNativeInputs > 0 || state.backgroundTasks > 0 || state.subagentHistoryPresent) return this.attention(cycle, '检测到原生队列、子agent或后台工作，停止自动推进。');
-    if (cycle.triggerRuntime.model && state.model && cycle.triggerRuntime.model !== state.model
+    if (modelChanged(cycle.triggerRuntime.model, state.model)
       || cycle.session.client === 'opencode' && cycle.triggerRuntime.agent !== state.agent)
       return this.attention(cycle, '维护期间模型发生变化，请核对用户操作。');
     if ((cycle.triggerRuntime.effort && state.effort && cycle.triggerRuntime.effort !== state.effort)
@@ -241,13 +316,19 @@ export class MaintenanceController {
       if (!tokens?.[stage]) return this.attention(cycle, '维护阶段凭证不可用。', 'not_submitted');
       const messageId = cycle.session.client === 'opencode' ? nativeMessageId() : null;
       const prompts = await readPromptSettings(this.root);
-      cycle = this.store.updateCycle(id, cycle.state, { controlDispatched: true, controlTurnId: messageId, controlRequestId: randomUUID(), retryHeadId: null, recoveryBoundary: null, controlIntentAt: new Date().toISOString(), controlPromptRevision: prompts.revision });
-      const prompt = stage === 'handoff' ? handoffPrompt(this.root, cycle, tokens[stage], prompts.values) : restorePrompt(this.root, cycle, tokens[stage], prompts.values);
+      const requestId = randomUUID(), token = randomBytes(24).toString('base64url');
+      cycle = this.store.transaction(() => {
+        this.store.setSetting('cycle-tokens:' + id, { ...tokens, [stage]: token });
+        return this.store.updateCycle(id, cycle.state, { controlDispatched: true, controlTurnId: messageId || (cycle.session.client === 'claude' ? requestId : null),
+          controlRequestId: requestId, receiptHashes: { ...cycle.receiptHashes, [stage]: receiptHash(token) },
+          retryHeadId: null, recoveryBoundary: null, lastReceiptIssue: null, controlIntentAt: new Date().toISOString(), controlPromptRevision: prompts.revision });
+      });
+      const prompt = stage === 'handoff' ? handoffPrompt(this.root, cycle, token, prompts.values) : restorePrompt(this.root, cycle, token, prompts.values);
       const result = await adapter.sendControl(prompt, state, { requestId: cycle.controlRequestId, ...(messageId ? { messageId } : {}) });
       const current = this.store.cycle(id);
-      this.store.updateCycle(id, current.state, { controlTurnId: result.activeTurnId || result.requestId || null, controlResult: result });
+      this.store.updateCycle(id, current.state, { controlTurnId: result.activeTurnId || result.requestId || current.controlTurnId, controlResult: result });
       const awaitingNativeReceipt = cycle.session.client === 'opencode' && result.status === 'unknown' && messageId;
-      if (result.status !== 'submitted' && !awaitingNativeReceipt) this.attention(current, '维护提示的投递结果未确认。', result.status === 'state_conflict' ? 'not_submitted' : 'unknown');
+      if (result.status !== 'submitted' && !awaitingNativeReceipt && !this.store.checkpoint(id, stage)) this.attention(current, '维护提示的投递结果未确认。', result.status === 'state_conflict' ? 'not_submitted' : 'unknown');
       return;
     }
     const endedControl = controlTurnEnded(cycle, state);
@@ -304,6 +385,7 @@ export class MaintenanceController {
   }
   async retry(id) {
     const cycle = this.store.cycle(id);
+    if (cycle) this.store.restartConfirmation?.assertAllowed(cycle.session);
     const documentStage = ['writing_handoff', 'restoring'].includes(cycle?.previousState);
     if (cycle) (await readAccessPolicy()).assert(cycle.session.cwd);
     if (!['needs_attention', 'user_intervened'].includes(cycle?.state)
@@ -322,17 +404,25 @@ export class MaintenanceController {
   }
   async reconcile(id) {
     const cycle = this.store.cycle(id);
+    if (cycle) this.store.restartConfirmation?.assertAllowed(cycle.session);
     if (!cycle || !['needs_attention', 'user_intervened'].includes(cycle.state) || this.running.has(id)) throw new Error('该流程当前无需核对恢复。');
     (await readAccessPolicy()).assert(cycle.session.cwd);
     const sample = await this.monitor.sample(cycle.session), runtime = sample.runtime;
     if (runtime.connected && runtime.activity === 'idle' && runtime.instanceId !== cycle.triggerRuntime.instanceId) {
       await this.recoverClient(cycle, sample); return;
     }
-    if (!runtime.connected || runtime.activity !== 'idle' || runtime.instanceId !== cycle.triggerRuntime.instanceId) throw new Error('原生实例未处于可确认的空闲状态。');
+    if (!runtime.connected || runtime.instanceId !== cycle.triggerRuntime.instanceId) throw new Error('请先重新连接原来的会话，再检查并继续。');
     for (const field of ['model', 'effort', 'permissionMode', 'agent']) {
-      if (cycle.triggerRuntime[field] != null && runtime[field] != null && cycle.triggerRuntime[field] !== runtime[field]) throw new Error('原生模型、思考强度或权限选项与触发时不一致。');
+      if (field === 'model' ? modelChanged(cycle.triggerRuntime.model, runtime.model) : cycle.triggerRuntime[field] != null && runtime[field] != null && cycle.triggerRuntime[field] !== runtime[field]) throw new Error('原生模型、思考强度或权限选项与触发时不一致。');
     }
     if (!samePermissionSelection(cycle.triggerRuntime, runtime)) throw new Error('原生权限选项与触发时不一致。');
+    if (recoverableReceiptPause(cycle) && cycle.controlDispatched && cycle.controlTurnId === runtime.activeTurnId && active(runtime)
+      && !runtime.quota && !runtime.requiresReopen && !runtime.queuedNativeInputs && !runtime.backgroundTasks && !runtime.subagentHistoryPresent
+      && !runtime.unconfirmedSubmissions && ['writing_handoff', 'restoring'].includes(cycle.previousState)) {
+      this.transition(cycle, cycle.previousState, { reason: null, recoveryBlocked: false, lastReceiptIssue: null });
+      return; // Reopen the original turn's receipt gate; never send another prompt.
+    }
+    if (runtime.activity !== 'idle') throw new Error('原会话仍在处理其他工作，请等待当前回复结束后再检查。');
     const stage = cycle.previousState;
     const lastTurnId = cycle.session.client === 'claude' ? runtime.lastCompletedTurnId : runtime.latestTurn?.id;
     let next, patch = {};
@@ -365,7 +455,7 @@ export class MaintenanceController {
     await this.advance(id);
   }
   async close() {
-    this.closed = true; clearInterval(this.timer);
+    this.closed = true; this.quotaRecovery.close(); clearInterval(this.timer);
     await this.tickPromise; await this.recoveryPromise; await Promise.allSettled([...this.running.values()]); this.monitor.close();
   }
 }

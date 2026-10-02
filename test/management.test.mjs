@@ -37,6 +37,25 @@ test('one manager per project and A policy changes do not alter B defaults', asy
   assert.equal(f.store.getPolicy(recipient).softPercent, 50);
   assert.throws(() => f.store.savePolicy(sender, { softPercent: 99, hardPercent: 60 }));
 });
+test('manager reload preserves a confirmed paused failure, its checkpoint and its queued messages', async t => {
+  const f = await storeFixture(t); f.store.acquireManager();
+  const cycle = f.store.createCycle({ session: recipient, state: 'needs_attention', previousState: 'compacting',
+    reason: '原生压缩未成功完成。', lastAttemptOutcome: 'failed', compactDispatched: true,
+    compactResult: { status: 'failed', requestId: 'original-request' } });
+  f.store.saveCheckpoint(cycle.id, 'handoff', { at: new Date().toISOString(), documentHash: 'original-hash' });
+  const queued = f.store.admit(record('must stay queued')); f.store.close();
+  const reopened = await f.open(); reopened.acquireManager();
+  assert.deepEqual(reopened.cycle(cycle.id), cycle);
+  assert.equal(reopened.checkpoint(cycle.id, 'handoff').documentHash, 'original-hash');
+  assert.equal(reopened.getMessage(queued.id).status, 'queued'); assert.equal(reopened.claimNext(sessionKey(recipient)), null);
+});
+test('manager restart cannot turn a settings or unknown-delivery pause into permission to resume', async t => {
+  const f = await storeFixture(t); f.store.acquireManager();
+  const cycle = f.store.createCycle({ session: recipient, state: 'needs_attention', previousState: 'writing_handoff',
+    reason: '维护期间模型发生变化，请核对用户操作。', lastAttemptOutcome: 'unknown', controlDispatched: true });
+  f.store.close(); const reopened = await f.open(); reopened.acquireManager();
+  assert.deepEqual(reopened.cycle(cycle.id), cycle);
+});
 test('a maintenance lock persists, new messages keep FIFO, and resume precedes queued messages', async t => {
   const f = await storeFixture(t); const cycle = f.store.createCycle({ session: recipient, state: 'writing_handoff' });
   const delivered = [];

@@ -18,12 +18,14 @@ export function openCodeHead(session, messages, nativeState, children = []) {
   const last = replies.at(-1), busy = nativeState && nativeState.type !== 'idle';
   const pendingTools = replies.flatMap(m => m.parts || []).filter(pending).length;
   const ended = !busy && !pendingTools && terminal(last?.info);
+  const rateLimited = ended && last?.info.error?.name === 'APIError' && last.info.error.data?.statusCode === 429;
   const selected = session.model || user?.info.model;
   const model = selected && { providerID: selected.providerID, modelID: selected.id || selected.modelID };
   const variant = session.model?.variant ?? user?.info.model?.variant ?? 'default';
   return { rows, user, last, modelSelection: model, model: model ? model.providerID + '/' + model.modelID : null,
     agent: session.agent || user?.info.agent, effort: variant, permissionMode: hash(session.permission || []),
-    activity: busy ? 'running' : pendingTools ? 'unknown' : 'idle', pendingTools,
+    activity: busy ? 'running' : pendingTools ? 'unknown' : rateLimited ? 'quota_limited' : 'idle', pendingTools,
+    quota: rateLimited ? { turnId: user.info.id, kind: 'unknown_rate_limit', source: 'opencode-native-error', autoResume: false } : null,
     activeTurnId: busy ? user?.info.id || null : null,
     latestTurn: user ? { id: user.info.id, status: ended ? last.info.error ? last.info.error.name === 'MessageAbortedError' ? 'interrupted' : 'failed' : 'completed' : 'running',
       itemTypes: (user.parts || []).some(p => p.type === 'compaction') ? ['contextCompaction'] : ['userMessage'],
@@ -76,6 +78,7 @@ export class OpenCodeMaintenance {
       head.model, head.agent, head.effort, head.permissionMode, session.revert || null, children.map(c => c.id), input.revision, [...input.pending]]);
     const state = { sessionId: id, cwd: this.directory, instanceId: this.instanceId, connected: true, activity,
       activityRevision: revision, activeTurnId: head.activeTurnId, latestTurn: head.latestTurn, lastCompletedTurnId: head.lastCompletedTurnId,
+      quota: head.quota,
       model: head.model, modelSelection: head.modelSelection, agent: head.agent, effort: head.effort, permissionMode: head.permissionMode,
       subagentHistoryPresent: head.subagentHistoryPresent, pendingRequests: permissions + questions, queuedNativeInputs: input.pending.size,
       reverted: Boolean(session.revert), observedAt: new Date().toISOString(),

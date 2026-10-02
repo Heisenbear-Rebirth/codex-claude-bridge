@@ -8,6 +8,9 @@ export function validatePolicy(policy) {
 }
 export function evaluatePolicy({ policy, runtime, usage, cycle, lastCycle } = {}) {
   const decision = (action, reason, extra = {}) => ({ action, reason, ...extra });
+  if (runtime?.quotaRestart?.pending) return decision('wait_quota', runtime.quotaRestart.reason);
+  if (runtime?.quota || runtime?.activity === 'quota_limited') return decision('wait_quota', '因额度不足中断，等待额度恢复；暂停上下文压缩。');
+  if (runtime?.requiresReopen) return decision('disabled', runtime.detail);
   if (runtime?.capabilities?.automaticMaintenance === false || policy?.session?.client === 'opencode' && runtime?.capabilities?.automaticMaintenance !== true)
     return decision('disabled', '原生维护能力尚未就绪，请加载新版插件并刷新状态。');
   if (!policy?.enabled) return decision('disabled', '此会话未启用自动管理。');

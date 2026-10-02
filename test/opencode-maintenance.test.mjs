@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
-import { randomUUID, randomInt } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { createOpenCodeBridge, nativeMessageId } from '../src/opencode-bridge.mjs';
 import { createOpenCodeAdapter } from '../src/adapters/opencode.mjs';
 import { startServer } from '../src/http-server.mjs';
@@ -55,7 +55,7 @@ async function fixture(t, { working = false } = {}) {
   config: { providers: async () => ({ data: { providers: [{ id: 'fixture', models: { actual: { limit: { context: 1000 } } } }] } }) } };
   const connect = async () => { bridge = await createOpenCodeBridge({ client, directory: root }, { root, acceptUserMessages: true, maintenanceHooks: true }); return bridge; };
   await connect(); const adapter = createOpenCodeAdapter({ root });
-  const start = async () => { manager = await startServer({ root, port: randomInt(20000, 65000), adapters: { opencode: adapter }, startMonitoring: false }); return manager; };
+  const start = async () => { manager = await startServer({ root, port: 0, adapters: { opencode: adapter }, startMonitoring: false }); return manager; };
   await start();
   t.after(async () => { releaseCompact?.(); await manager.close(); await bridge.close(); await rm(root, { recursive: true, force: true }); });
   const policy = manager.store.savePolicy(target, { enabled: true, mode: 'automatic' });
@@ -163,11 +163,32 @@ test('OpenCode late compaction completion remains owned by the plugin and is rec
   const f = await fixture(t); f.hang(); const c = await f.begin();
   await f.receipt(c.id, 'handoff'); f.finish(); await f.advanceTo(c.id, 'compacting'); await f.manager.controller.advance(c.id);
   assert.equal(f.counts().compactions, 1); await f.manager.close(); await f.start();
+  await assert.rejects(f.manager.controller.reconcile(c.id), /待确认接续/);
+  const consent = f.manager.store.restartConfirmation;
+  consent.decide({ bootId: consent.bootId, items: consent.list().map(({ id, revision }) => ({ id, revision })), action: 'approve' });
   f.release();
   for (let i = 0; i < 20 && f.busy; i++) await new Promise(setImmediate);
   await f.manager.controller.reconcile(c.id);
   await f.advanceTo(c.id, 'restoring');
   assert.equal(f.counts().compactions, 1);
+});
+
+test('OpenCode current native 429 holds direct delivery and maintenance, survives restart consent, and releases FIFO after native recovery', async t => {
+  const f = await fixture(t), failed = f.rows.findLast(r => r.info.role === 'assistant');
+  failed.info.error = { name: 'APIError', data: { statusCode: 429, message: 'private provider message' } };
+  const runtime = f.manager.monitor.runtime(f.target), state = await runtime.status();
+  assert.equal(state.activity, 'quota_limited'); assert.equal(state.quota.autoResume, false);
+  assert.equal((await runtime.compact(state)).status, 'state_conflict');
+  const direct = await f.adapter.send({ targetId: f.target.id, targetSession: f.target, messageId: randomUUID(), text: 'held direct' });
+  assert.equal(direct.status, 'deferred'); assert.equal(direct.notSubmitted, true);
+  const queued = await f.manager.service.mailbox.send({ id: randomUUID(), createdAt: new Date().toISOString(), from: { ...f.target, client: 'codex' }, to: f.target, text: 'held FIFO' });
+  assert.equal(queued.status, 'queued'); assert.equal(f.calls.length, 0);
+  await f.manager.close(); await f.start();
+  const gate = f.manager.store.restartConfirmation;
+  assert.equal(gate.list().length, 1); gate.decide({ bootId: gate.bootId, items: gate.list(), action: 'approve' });
+  await f.manager.monitor.sample(f.target); await f.manager.service.mailbox.flush(); assert.equal(f.calls.length, 0);
+  f.assistant(f.user()); f.finish(100); await f.manager.monitor.sample(f.target); await f.manager.service.mailbox.flush();
+  assert.equal(f.calls.length, 1); assert.match(f.calls[0].parts[0].text, /held FIFO/); assert.equal(f.counts().compactions, 0);
 });
 
 test('OpenCode uncertain prompt delivery is reconciled without a second submission, including plugin restart', async t => {

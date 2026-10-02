@@ -4,6 +4,7 @@ import { readdir, stat, open } from 'node:fs/promises';
 import { StringDecoder } from 'node:string_decoder';
 import { homedir } from 'node:os';
 import { join, resolve, relative, isAbsolute } from 'node:path';
+import { knownModel } from './model-identity.mjs';
 
 const count = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 const sum = values => values.every(value => value !== null) ? values.reduce((a, b) => a + b, 0) : null;
@@ -61,6 +62,7 @@ export function createUsageAccumulator(client, id) {
         if (row.type === 'system' && row.subtype === 'compact_boundary') { latestBoundary = row.timestamp; latest = null; pendingHistoryChange = true; return; }
         if (row.type === 'user') pendingHistoryChange = true;
         if (row.type !== 'assistant' || !row.message?.usage) return;
+        if (row.message.model && !knownModel(row.message.model)) return;
         const usage = row.message.usage;
         model = row.message.model || model;
         const input = count(usage.input_tokens);

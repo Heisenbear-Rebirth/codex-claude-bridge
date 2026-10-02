@@ -10,10 +10,10 @@ import { MaintenanceController } from '../src/maintenance-controller.mjs';
 import { PromptSettings } from '../src/prompt-settings.mjs';
 import { defaultPromptValues } from '../public/prompt-templates.mjs';
 
-async function harness(t, wasWorking = false, delayedInterrupt = false, recoveryEvidence) {
+async function harness(t, wasWorking = false, delayedInterrupt = false, recoveryEvidence, client = 'claude') {
   const root = await mkdtemp(join(resolve('.'), '.maintenance-test-'));
   const store = await new ManagementStore(join(root, '.cooperation')).init();
-  const target = { client: 'claude', id: '11111111-1111-4111-8111-111111111111', cwd: root, name: 'fixture' };
+  const target = { client, id: '11111111-1111-4111-8111-111111111111', cwd: root, name: 'fixture' };
   let count = 0, compactCount = 0, interruptCount = 0;
   const delivered = [];
   const state = { connected: true, activity: wasWorking ? 'running' : 'idle', activeTurnId: wasWorking ? 'original' : null,
@@ -22,20 +22,20 @@ async function harness(t, wasWorking = false, delayedInterrupt = false, recovery
   const usage = { usedTokens: 600, contextWindowTokens: 1000, contextEpoch: 0 };
   const runtime = {
     async status() { return structuredClone(state); },
-    async sendControl(text) { const id = 'control-' + (++count); state.activity = 'running'; state.activeTurnId = id; delivered.push(text); return { status: 'submitted', activeTurnId: id, requestId: id }; },
+    async sendControl(text) { const id = 'control-' + (++count); state.activity = 'running'; state.activeTurnId = id; if (client === 'codex') state.latestTurn = { id, status: 'inProgress' }; delivered.push(text); return { status: 'submitted', activeTurnId: id, requestId: id }; },
     async interrupt() { interruptCount++; if (!delayedInterrupt) { state.activity = 'idle'; state.lastCompletedTurnId = state.activeTurnId; state.activeTurnId = null; } return { status: 'acknowledged' }; },
     async compact() { compactCount++; usage.contextEpoch++; usage.usedTokens = 100; state.lastCompletedTurnId = 'compact-' + compactCount;
       return { status: 'completed', requestId: state.lastCompletedTurnId, completedAt: new Date().toISOString(), boundary: { trigger: 'manual' } }; }, close() {},
   };
   const monitor = { sample: async () => ({ runtime: structuredClone(state), usage: { ...usage }, decision: { trigger: wasWorking ? 'hard' : 'soft', wasWorkingAtTrigger: wasWorking } }), runtime: () => runtime, close() {} };
-  const service = { adapters: { claude: { find: async () => target } }, mailbox: new SessionMailbox({ store,
+  const service = { adapters: { [client]: { find: async () => target } }, mailbox: new SessionMailbox({ store,
     deliverMessage: async m => { delivered.push(m.text); return { status: 'submitted' }; }, deliverResume: async () => { delivered.push('continue'); return { status: 'submitted' }; } }) };
   const controller = new MaintenanceController({ root, store, service, monitor, recoveryEvidence });
-  const checkpoints = new CheckpointService({ root, store });
+  const checkpoints = new CheckpointService({ root, store, readRuntime: () => runtime.status() });
   t.after(async () => { await controller.close(); await service.mailbox.close(); store.close(); assert.ok(root.startsWith(resolve('.') + '\\') || root.startsWith(resolve('.') + '/')); await rm(root, { recursive: true, force: true }); });
   const policy = { enabled: true, softPercent: 50, hardPercent: 80, mode: 'automatic' };
   const cycle = await controller.trigger(target, policy, await monitor.sample());
-  const endTurn = () => { state.lastCompletedTurnId = state.activeTurnId; state.activeTurnId = null; state.activity = 'idle'; };
+  const endTurn = () => { state.lastCompletedTurnId = state.activeTurnId; if (client === 'codex') state.latestTurn = { id: state.activeTurnId, status: 'completed' }; state.activeTurnId = null; state.activity = 'idle'; };
   const receipt = async stage => {
     const c = store.cycle(cycle.id); const tokens = store.getSetting('cycle-tokens:' + c.id);
     return checkpoints.accept({ from: target, cycleId: c.id, stage, receiptToken: tokens[stage], documentPath: c.handoffPath });
@@ -75,6 +75,84 @@ test('receipt rejects a different session, wrong stage, wrong token and changed 
   await h.checkpoints.accept(request); h.endTurn(); await h.controller.advance(cycle.id); await h.controller.advance(cycle.id); await h.controller.advance(cycle.id); await h.controller.advance(cycle.id);
   await writeFile(cycle.handoffPath, 'modified'); await assert.rejects(h.receipt('restored'), /内容不一致/);
   assert.equal(h.store.activeCycle(h.target).id, cycle.id);
+});
+
+test('quota failure inside handoff retains its lock and queued messages without compression, generic resume or timeout retry', async t => {
+  const h = await harness(t); const cycle = h.store.cycle(h.cycle.id);
+  h.state.activity = 'quota_limited'; h.state.quota = { turnId: h.state.activeTurnId, autoResume: true }; h.state.activeTurnId = null;
+  h.store.updateCycle(cycle.id, cycle.state, { deadlineAt: '2000-01-01T00:00:00Z' });
+  await h.controller.advance(cycle.id);
+  assert.equal(h.store.cycle(cycle.id).state, 'needs_attention'); assert.equal(h.store.cycle(cycle.id).recoveryBlocked, true);
+  assert.match(h.store.cycle(cycle.id).reason, /额度不足/); assert.equal(h.compactCount(), 0);
+  assert.equal(h.store.activeCycle(h.target).id, cycle.id);
+  await h.controller.advance(cycle.id); assert.equal(h.delivered.length, 1);
+});
+
+for (const client of ['claude', 'codex']) test(`${client}: a maintenance turn still writing its handoff after ten minutes remains eligible to submit its receipt`, async t => {
+  const h = await harness(t, false, false, undefined, client); const c = h.store.cycle(h.cycle.id);
+  h.store.updateCycle(c.id, c.state, { deadlineAt: '2000-01-01T00:00:00Z' });
+  await h.controller.advance(c.id);
+  assert.equal(h.store.cycle(c.id).state, 'writing_handoff');
+  await mkdir(dirname(c.handoffPath), { recursive: true }); await writeFile(c.handoffPath, 'Long but legitimate handoff');
+  assert.equal((await h.receipt('handoff')).status, 'accepted'); assert.equal(h.compactCount(), 0);
+});
+
+for (const client of ['claude', 'codex']) test(`${client}: a verified late handoff receipt recovers a timed-out original turn without rewriting or resending`, async t => {
+  const h = await harness(t, false, false, undefined, client); const c = h.store.cycle(h.cycle.id);
+  await mkdir(dirname(c.handoffPath), { recursive: true }); await writeFile(c.handoffPath, 'Existing handoff');
+  h.controller.attention(c, '维护阶段超时；会话锁及排队消息已保留。');
+  assert.equal((await h.receipt('handoff')).status, 'accepted');
+  assert.equal(h.store.cycle(c.id).state, 'awaiting_handoff_end'); assert.equal(h.store.cycle(c.id).lateReceiptAccepted, true);
+  assert.equal(h.delivered.length, 1); assert.equal(h.compactCount(), 0);
+  h.endTurn(); await h.controller.advance(c.id); await h.controller.advance(c.id); assert.equal(h.compactCount(), 1);
+});
+
+test('late receipts still reject user intervention and expose token-free diagnostic reasons', async t => {
+  const h = await harness(t); const c = h.store.cycle(h.cycle.id);
+  await mkdir(dirname(c.handoffPath), { recursive: true }); await writeFile(c.handoffPath, 'Existing handoff');
+  h.controller.attention(c, '维护阶段超时；会话锁及排队消息已保留。');
+  h.state.activeTurnId = 'new-user-turn';
+  await assert.rejects(h.receipt('handoff'), error => error.code === 'CHECKPOINT_NATIVE_TURN_CHANGED');
+  const issue = h.store.cycle(c.id).lastReceiptIssue; assert.equal(issue.code, 'CHECKPOINT_NATIVE_TURN_CHANGED');
+  assert.equal(JSON.stringify(issue).includes(h.store.getSetting('cycle-tokens:' + c.id).handoff), false);
+  h.store.updateCycle(c.id, 'user_intervened', { previousState: 'writing_handoff' });
+  h.state.activeTurnId = c.controlTurnId;
+  await assert.rejects(h.receipt('handoff'), /维护已暂停/); assert.equal(h.store.checkpoint(c.id, 'handoff'), null);
+});
+
+test('an unaccepted backup from a rejected receipt cannot block a later valid document', async t => {
+  const h = await harness(t); const c = h.store.cycle(h.cycle.id);
+  await mkdir(dirname(c.handoffPath), { recursive: true }); await writeFile(c.handoffPath, 'Earlier attempt');
+  h.controller.attention(c, '维护阶段超时；会话锁及排队消息已保留。'); h.state.connected = false;
+  await assert.rejects(h.receipt('handoff'), error => error.code === 'CHECKPOINT_NATIVE_TURN_CHANGED');
+  await writeFile(c.handoffPath, 'Corrected document'); h.state.connected = true;
+  assert.equal((await h.receipt('handoff')).status, 'accepted');
+  assert.match(h.store.checkpoint(c.id, 'handoff').backupPath, /handoff-[a-f0-9]{64}\.md$/);
+});
+
+test('a delivery metadata update during document validation does not reject a valid receipt', async t => {
+  const h = await harness(t); const c = h.store.cycle(h.cycle.id);
+  await mkdir(dirname(c.handoffPath), { recursive: true }); await writeFile(c.handoffPath, 'Existing handoff');
+  const transaction = h.store.transaction.bind(h.store); let once = true;
+  h.store.transaction = fn => { if (once) { once = false; h.store.updateCycle(c.id, 'writing_handoff', { controlResult: { status: 'submitted' } }); } return transaction(fn); };
+  assert.equal((await h.receipt('handoff')).status, 'accepted'); assert.equal(h.store.cycle(c.id).state, 'awaiting_handoff_end');
+});
+
+test('check and continue reopens a timed-out original live turn without sending a second handoff prompt', async t => {
+  const h = await harness(t); const c = h.store.cycle(h.cycle.id);
+  h.controller.attention(c, '维护阶段超时；会话锁及排队消息已保留。');
+  await h.controller.reconcile(c.id); assert.equal(h.store.cycle(c.id).state, 'writing_handoff'); assert.equal(h.delivered.length, 1);
+  await mkdir(dirname(c.handoffPath), { recursive: true }); await writeFile(c.handoffPath, 'Existing original work');
+  assert.equal((await h.receipt('handoff')).status, 'accepted'); assert.equal(h.compactCount(), 0);
+});
+
+test('explicitly retrying a stage rotates its receipt credential so delayed older attempts cannot confirm the new request', async t => {
+  const h = await harness(t); const c = h.store.cycle(h.cycle.id), oldToken = h.store.getSetting('cycle-tokens:' + c.id).handoff;
+  h.endTurn(); h.controller.attention(c, '目标轮次已结束，但系统未收到阶段回执。', 'failed'); await h.controller.retry(c.id);
+  assert.notEqual(h.store.getSetting('cycle-tokens:' + c.id).handoff, oldToken);
+  await mkdir(dirname(c.handoffPath), { recursive: true }); await writeFile(c.handoffPath, 'Existing original work');
+  await assert.rejects(h.checkpoints.accept({ from: h.target, cycleId: c.id, stage: 'handoff', receiptToken: oldToken, documentPath: c.handoffPath }), /凭证不匹配/);
+  assert.equal((await h.receipt('handoff')).status, 'accepted');
 });
 
 test('maintenance uses customized handoff, next-stage restore and continuation while preserving real checkpoint gates', async t => {
@@ -204,6 +282,21 @@ async function reconnect(h, instance = 'restarted') {
   h.state.lastCompletedTurnId = null; h.state.activityRevision++;
   h.controller.recoveryPollAt.clear(); await h.controller.advance(h.cycle.id);
 }
+for (const client of ['claude', 'codex']) test(`${client}: service restart before the still-live client is ready preserves and advances an accepted handoff`, async t => {
+  const h = await harness(t, false, false, undefined, client), id = h.cycle.id;
+  await mkdir(dirname(h.cycle.handoffPath), { recursive: true }); await writeFile(h.cycle.handoffPath, 'saved handoff');
+  await h.receipt('handoff'); h.store.recoverInFlight();
+  await h.controller.advance(id); assert.equal(h.delivered.length, 1); assert.equal(h.compactCount(), 0);
+  h.endTurn(); h.controller.recoveryPollAt.clear(); await h.controller.advance(id); await h.controller.advance(id);
+  assert.equal(h.store.cycle(id).state, 'compacting'); assert.equal(h.delivered.length, 1);
+});
+test('service restart reopens the original running handoff receipt gate without resending', async t => {
+  const h = await harness(t), id = h.cycle.id;
+  h.store.recoverInFlight(); await h.controller.advance(id);
+  assert.equal(h.store.cycle(id).state, 'writing_handoff'); assert.equal(h.delivered.length, 1);
+  await mkdir(dirname(h.cycle.handoffPath), { recursive: true }); await writeFile(h.cycle.handoffPath, 'saved');
+  assert.equal((await h.receipt('handoff')).status, 'accepted');
+});
 test('offline maintenance pauses its deadline and keeps queued messages until the same client returns', async t => {
   const h=await harness(t), id=h.cycle.id;
   h.state.connected=false; h.store.updateCycle(id,h.store.cycle(id).state,{deadlineAt:new Date(0).toISOString()});
@@ -263,6 +356,13 @@ test('changed document and changed selected settings block restart recovery', as
 test('a known model change never triggers an automatic resend after restart',async t=>{
   const h=await harness(t,false,false,async()=>({verified:true,lastInputId:'control-1'}));
   h.state.model='different';await reconnect(h);assert.equal(h.store.cycle(h.cycle.id).recoveryBlocked,true);assert.equal(h.delivered.length,1);
+});
+test('reopened maintenance waits for selected settings to arrive instead of treating unknown as unchanged', async t => {
+  const h = await harness(t, false, false, async () => ({ verified: true, lastInputId: 'control-1' }));
+  h.state.model = null; await reconnect(h);
+  assert.equal(h.store.cycle(h.cycle.id).state, 'waiting_client'); assert.equal(h.delivered.length, 1);
+  h.state.model = 'fixed'; h.controller.recoveryPollAt.clear(); await h.controller.advance(h.cycle.id);
+  assert.equal(h.store.cycle(h.cycle.id).controlDispatched, false);
 });
 test('a receipt arriving during recovery evidence read is not overwritten',async t=>{
   let accept;

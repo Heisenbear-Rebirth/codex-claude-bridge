@@ -278,6 +278,28 @@ export async function probeCodexBridge(context = {}) {
 }
 
 /** Send once through the App bridge using the real originating Codex context. */
+export async function readCodexUsageLimits(context = {}) {
+  const pipePath = context.pipePath ?? process.env.CODEX_APP_TOOLS_PIPE_PATH;
+  const callerThreadId = context.callerThreadId ?? process.env.CODEX_THREAD_ID;
+  const bridgePath = context.bridgePath ?? await discoverBridge(context.codexHome);
+  if (!pipePath || !callerThreadId || !bridgePath) throw adapterError('CODEX_QUOTA_UNAVAILABLE', 'Codex 额度连接尚未就绪。');
+  const bridge = startBridge({ nodePath: context.nodePath ?? process.env.CODEX_MCP_NODE_PATH ?? process.execPath,
+    bridgePath, pipePath, handshakeTimeoutMs: context.handshakeTimeoutMs ?? 3000, requestTimeoutMs: context.requestTimeoutMs ?? 15000 });
+  try {
+    await bridge.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'cooperation', version: '0.2.0' } });
+    bridge.notify('notifications/initialized');
+    const catalog = await bridge.request('tools/list', {});
+    const tool = catalog.tools?.find(t => t.name === 'get_usage_limits' || t.name?.endsWith('__get_usage_limits'));
+    if (!tool) throw adapterError('CODEX_QUOTA_UNAVAILABLE', '此版本 Codex 未开放额度读取。');
+    const result = await bridge.call(tool.name, {}, callerThreadId);
+    if (result?.isError) throw adapterError('CODEX_QUOTA_UNAVAILABLE', 'Codex 额度读取失败。');
+    if (result?.structuredContent) return result.structuredContent;
+    for (const item of result?.content || []) if (item.type === 'text') { try { return JSON.parse(item.text); } catch {} }
+    throw adapterError('CODEX_QUOTA_UNAVAILABLE', 'Codex 额度格式暂不受支持。');
+  } finally { await bridge.close(); }
+}
+
+/** Send once through the App bridge using the real originating Codex context. */
 export async function sendCodexMessage({ targetId, text, context = {} } = {}) {
   if (typeof targetId !== 'string' || !targetId.trim() || typeof text !== 'string' || !text.trim()) {
     throw adapterError('CODEX_INVALID_MESSAGE', 'A target conversation ID and non-empty message are required.');

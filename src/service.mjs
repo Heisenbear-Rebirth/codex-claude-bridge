@@ -24,11 +24,24 @@ export class CooperationService {
       codex: { list: listCodexSessions, find: findCodexSession, send: sendCodexMessage },
       opencode: createOpenCodeAdapter({ root }),
     };
+    // Injected transports may provide their own runtime. Production Codex
+    // deliveries read the existing native owner; the send still uses App Tools.
+    this.deliveryRuntimeFactory = runtimeFactory || (!adapters ? session => createRuntime(session, { opencode: this.adapters.opencode }) : null);
     if (store?.reserveLifecycle) this.lifecycle = new SessionLifecycle({ store, root, adapters: this.adapters, directories: lifecycleDirectories, accessPolicy,
       runtimeFactory: runtimeFactory || (session => createRuntime(session, { opencode: this.adapters.opencode })) });
     if (store?.admit) this.mailbox = new SessionMailbox({ store, onMessage,
       deliverMessage: async record => {
         const access = this.accessPolicy || await readAccessPolicy(); access.assert(record.from.cwd); access.assert(record.to.cwd);
+        if (record.to.client === 'codex' && this.deliveryRuntimeFactory) {
+          let runtime;
+          try {
+            runtime = this.deliveryRuntimeFactory(record.to);
+            const current = await runtime.status();
+            if (current.quota) return { status: 'deferred', notSubmitted: true, runtime: current,
+              detail: '接收会话额度不足，消息已保留，等待额度恢复。' };
+          } catch { /* An unavailable observer is not evidence of exhausted quota. */ }
+          finally { runtime?.close?.(); }
+        }
         const context = record.to.client === 'codex' && this.codexBridge ? await this.codexBridge.getContext() : this.codexContext;
         try { return await this.adapters[record.to.client].send({ ...await this.deliveryPayload(record), context }); }
         catch (error) { if (record.to.client === 'codex') this.codexBridge?.invalidate(); throw error; }
@@ -86,7 +99,7 @@ export class CooperationService {
   }
   publicCycle(cycle) {
     if (!cycle) return null;
-    return Object.fromEntries(['id', 'state', 'previousState', 'trigger', 'wasWorkingAtTrigger', 'createdAt', 'updatedAt', 'reason', 'handoffPath', 'lastAttemptOutcome', 'completedAt'].map(key => [key, cycle[key]]));
+    return Object.fromEntries(['id', 'state', 'previousState', 'trigger', 'wasWorkingAtTrigger', 'createdAt', 'updatedAt', 'reason', 'handoffPath', 'lastAttemptOutcome', 'completedAt', 'lastReceiptIssue', 'lateReceiptAccepted'].map(key => [key, cycle[key]]));
   }
   async send({ from, to, message }, source) {
     if (typeof message !== 'string' || !message.trim()) throw new Error('消息内容不能为空。');

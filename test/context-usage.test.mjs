@@ -15,6 +15,8 @@ test('Claude counts all input cache categories once and leaves unknown capacity 
   assert.equal(accumulator.result().usedPercent, null); assert.equal(accumulator.result().contextWindowTokens, null);
   accumulator.add({ type: 'assistant', parent_tool_use_id: 'child', message: { usage: { input_tokens: 99999 } } });
   assert.equal(accumulator.result().usedTokens, 31933);
+  accumulator.add({ type: 'assistant', sessionId: 'id', message: { model: '<synthetic>', usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } } });
+  assert.equal(accumulator.result().usedTokens, 31933); assert.equal(accumulator.result().model, 'm');
   accumulator.add({ type: 'system', subtype: 'compact_boundary', sessionId: 'id', timestamp: 't2' });
   assert.equal(accumulator.result().available, false);
 });

@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { POLICY_DEFAULTS, validatePolicy } from './context-policy.mjs';
 import { matchesDirectories, containsDirectory } from './directory-service.mjs';
+import { restartCandidate } from './maintenance-recovery.mjs';
+import { RestartConfirmation } from './restart-confirmation.mjs';
 
 const json = value => JSON.stringify(value);
 const parse = row => row ? JSON.parse(row.data) : null;
@@ -71,7 +73,9 @@ export class ManagementStore {
       this.managerToken = randomUUID();
       this.db.prepare('INSERT INTO manager VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,pid=excluded.pid,epoch=excluded.epoch,started_at=excluded.started_at')
         .run(this.managerToken, process.pid, (existing?.epoch || 0) + 1, now());
-      this.recoverInFlight(); return this.managerToken;
+      this.recoverInFlight();
+      this.restartConfirmation = new RestartConfirmation(this); this.restartConfirmation.start();
+      return this.managerToken;
     });
   }
   assertManager() {
@@ -83,7 +87,11 @@ export class ManagementStore {
     }
     for (const cycle of this.activeCycles()) {
       if (cycle.state === 'user_intervened' || cycle.recoveryBlocked || cycle.state === 'waiting_client') continue;
-      this.updateCycle(cycle.id, 'needs_attention', { previousState: ['needs_attention', 'user_intervened', 'waiting_client'].includes(cycle.state) ? cycle.previousState : cycle.state, reason: '服务重启，需核对上一次外部操作及原生轮次后继续。' });
+      // A reload does not turn an already confirmed failure into a crashed
+      // in-flight operation. Keep its cause, lock and receipts unchanged.
+      if (cycle.state === 'needs_attention' && !restartCandidate(cycle)) continue;
+      this.updateCycle(cycle.id, 'needs_attention', { previousState: ['needs_attention', 'user_intervened', 'waiting_client'].includes(cycle.state) ? cycle.previousState : cycle.state,
+        serviceRestartPending: true, reason: '服务重启，需核对上一次外部操作及原生轮次后继续。' });
     }
   }
   close() {
@@ -132,7 +140,10 @@ export class ManagementStore {
     this.event('policy_saved', policy); return policy;
   }
   policies() { return this.db.prepare('SELECT data FROM policies').all().map(parse); }
-  saveSnapshot(session, data) { this.db.prepare('INSERT INTO snapshots VALUES(?,?) ON CONFLICT(session_key) DO UPDATE SET data=excluded.data').run(sessionKey(session), json(data)); }
+  saveSnapshot(session, data) {
+    this.restartConfirmation?.observe(data.session || session, data.runtime);
+    this.db.prepare('INSERT INTO snapshots VALUES(?,?) ON CONFLICT(session_key) DO UPDATE SET data=excluded.data').run(sessionKey(session), json(data));
+  }
   getSnapshot(session) { return parse(this.db.prepare('SELECT data FROM snapshots WHERE session_key=?').get(sessionKey(session))); }
   mailbox(key) { this.db.prepare('INSERT OR IGNORE INTO mailboxes(session_key) VALUES(?)').run(key); return this.db.prepare('SELECT * FROM mailboxes WHERE session_key=?').get(key); }
   activeCycle(session) { return parse(this.db.prepare("SELECT data FROM cycles WHERE session_key=? AND state NOT IN ('completed','cancelled')").get(sessionKey(session))); }
@@ -171,6 +182,10 @@ export class ManagementStore {
   claimNext(key) {
     return this.transaction(() => {
       this.assertManager(); const box = this.mailbox(key); if (box.locked_cycle || box.blocked) return null;
+      if (this.restartConfirmation && !this.restartConfirmation.canDrain(key)) return null;
+      const quota = this.getSetting('quota-recovery:' + key);
+      const snapshot = parse(this.db.prepare('SELECT data FROM snapshots WHERE session_key=?').get(key));
+      if (snapshot?.runtime?.quota || ['waiting', 'sending', 'attention'].includes(quota?.state)) return null;
       if (this.db.prepare("SELECT 1 FROM outbox WHERE target_key=? AND status='held'").get(key)) return null;
       if (this.db.prepare("SELECT 1 FROM outbox WHERE target_key=? AND status='sending'").get(key)) return null;
       const row = this.db.prepare("SELECT * FROM outbox WHERE target_key=? AND status='ready' ORDER BY priority,sequence LIMIT 1").get(key);
@@ -178,6 +193,22 @@ export class ManagementStore {
       this.db.prepare("UPDATE outbox SET status='sending' WHERE id=?").run(row.id);
       const data = parse(row); if (data.kind === 'message') this.update(data.messageId, { status: 'pending' });
       this.event('dispatch_intent', { id: row.id, targetKey: key }); return { id: row.id, targetKey: key, ...data };
+    });
+  }
+  deferOutbox(id, result) {
+    return this.transaction(() => {
+      this.assertManager();
+      const row = this.db.prepare("SELECT * FROM outbox WHERE id=? AND status='sending'").get(id);
+      if (!row || result.notSubmitted !== true) throw new Error('消息暂缓状态不可确认。');
+      const item = parse(row); if (item.kind !== 'message') throw new Error('仅普通消息可暂缓。');
+      this.db.prepare("UPDATE outbox SET status='ready' WHERE id=?").run(id);
+      this.update(item.messageId, { status: 'queued', detail: result.detail, error: null });
+      if (result.runtime?.quota && result.runtime.sessionId === item.to.id) {
+        const previous = this.getSnapshot(item.to);
+        this.saveSnapshot(item.to, { ...previous, session: previous?.session || item.to, runtime: result.runtime,
+          decision: { action: 'wait_quota', reason: result.detail }, observedAt: new Date().toISOString() });
+      }
+      this.event('dispatch_deferred', { id, reason: result.reason || 'receiver_quota' });
     });
   }
   finishOutbox(id, result) {
